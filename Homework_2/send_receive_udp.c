@@ -5,6 +5,7 @@
 #include <arpa/inet.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <netdb.h>
 #include <errno.h>
 #include <sys/select.h>
 
@@ -13,35 +14,36 @@
 
 // Error handling function
 void handle_error(const char *msg) {
-    fprintf(stderr, "%s: %s\n", msg, strerror(errno));
+    perror(msg);
     exit(EXIT_FAILURE);
 }
 
 // Set up UDP socket and return its file descriptor
-int setup_udp_socket(const char *server_name, const char *port_name) {
-    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sockfd < 0) {
+int setup_udp_socket(const char *server_name, const char *port_name, struct addrinfo **res) {
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;       // Use IPv4
+    hints.ai_socktype = SOCK_DGRAM;  // Use UDP
+
+    // Get address info
+    if (getaddrinfo(server_name, port_name, &hints, res) != 0) {
+        handle_error("Failed to get address info");
+    }
+
+    // Create socket
+    int sockfd = socket((*res)->ai_family, (*res)->ai_socktype, (*res)->ai_protocol);
+    if (sockfd == -1) {
         handle_error("Error opening socket");
     }
 
-    struct sockaddr_in server_addr;
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(atoi(port_name));
-
-    // Convert server name to IP address
-    if (inet_pton(AF_INET, server_name, &server_addr.sin_addr) <= 0) {
-        handle_error("Invalid server address");
-    }
-
-    // Return the socket file descriptor
     return sockfd;
 }
 
 // Read from standard input and send data over UDP
-int send_data(int sockfd, struct sockaddr_in *server_addr) {
+int send_data(int sockfd, struct addrinfo *res) {
     char send_buf[BUF_SIZE];
     ssize_t bytes_read = read(STDIN_FILENO, send_buf, BUF_SIZE);
+    
     if (bytes_read < 0) {
         handle_error("Error reading from standard input");
     }
@@ -49,9 +51,8 @@ int send_data(int sockfd, struct sockaddr_in *server_addr) {
         return 0; // EOF reached
     }
 
-    ssize_t bytes_sent = sendto(sockfd, send_buf, bytes_read, 0,
-                                 (struct sockaddr *)server_addr, sizeof(*server_addr));
-    if (bytes_sent < 0) {
+    ssize_t bytes_sent = sendto(sockfd, send_buf, bytes_read, 0, res->ai_addr, res->ai_addrlen);
+    if (bytes_sent == -1) {
         handle_error("Error sending UDP packet");
     }
     return 1; // Data sent successfully
@@ -61,6 +62,7 @@ int send_data(int sockfd, struct sockaddr_in *server_addr) {
 int receive_data(int sockfd) {
     char recv_buf[RECV_BUF_SIZE];
     ssize_t bytes_received = recvfrom(sockfd, recv_buf, RECV_BUF_SIZE, 0, NULL, NULL);
+    
     if (bytes_received < 0) {
         handle_error("Error receiving UDP packet");
     }
@@ -68,24 +70,21 @@ int receive_data(int sockfd) {
         return 0; // Empty packet received
     }
 
-    ssize_t bytes_written = write(STDOUT_FILENO, recv_buf, bytes_received);
-    if (bytes_written < 0) {
+    if (write(STDOUT_FILENO, recv_buf, bytes_received) < 0) {
         handle_error("Error writing to standard output");
     }
     return 1; // Data received successfully
 }
 
 int main(int argc, char *argv[]) {
-    if (argc != 3) {
+    if (argc < 3) {
         fprintf(stderr, "Usage: %s <server> <port>\n", argv[0]);
         return EXIT_FAILURE;
     }
 
-    // Set up the UDP socket
-    int sockfd = setup_udp_socket(argv[1], argv[2]);
-    struct sockaddr_in server_addr;
+    struct addrinfo *res;
+    int sockfd = setup_udp_socket(argv[1], argv[2], &res);
 
-    // Initialize file descriptor set for select
     fd_set read_fds;
     int keep_running = 1;
 
@@ -103,7 +102,7 @@ int main(int argc, char *argv[]) {
 
         // Handle data on standard input
         if (FD_ISSET(STDIN_FILENO, &read_fds)) {
-            keep_running = send_data(sockfd, &server_addr);
+            keep_running = send_data(sockfd, res);
         }
 
         // Handle data on the UDP socket
@@ -113,9 +112,10 @@ int main(int argc, char *argv[]) {
     }
 
     // Send an empty UDP packet to signal end-of-file
-    sendto(sockfd, NULL, 0, 0, (struct sockaddr *)&server_addr, sizeof(server_addr));
+    sendto(sockfd, "", 0, 0, res->ai_addr, res->ai_addrlen);
 
     // Cleanup
+    freeaddrinfo(res);
     close(sockfd);
 
     return EXIT_SUCCESS;
