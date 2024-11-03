@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <errno.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -9,15 +10,10 @@
 #include <sys/socket.h>
 #include <sys/select.h>
 
-#define BUFFER_SIZE 216
+#define BUFFER_SIZE 65536
 #define UDP_BUFFER_SIZE (BUFFER_SIZE + 2)
 
-void handle_error(const char *msg) {
-    perror(msg);
-    exit(EXIT_FAILURE);
-}
-
-// Helper function to convert the port name to a 16-bit unsigned integer
+// Function to convert the port name to a 16-bit unsigned integer
 static int convert_port_name(uint16_t *port, const char *port_name) {
     char *end;
     long long int nn;
@@ -37,29 +33,59 @@ static int convert_port_name(uint16_t *port, const char *port_name) {
     return 0;
 }
 
+ssize_t better_write(int fd, const char *buf, size_t count) {
+  size_t already_written, to_be_written, written_this_time, max_count;
+  ssize_t res_write;
+
+  if (count == ((size_t) 0)) return (ssize_t) count;
+  
+  already_written = (size_t) 0;
+  to_be_written = count;
+  while (to_be_written > ((size_t) 0)) {
+    max_count = to_be_written;
+    if (max_count > ((size_t) 8192)) {
+      max_count = (size_t) 8192;
+    }
+    res_write = write(fd, &(((const char *) buf)[already_written]), max_count);
+    if (res_write < ((size_t) 0)) {
+      /* Error */
+      return res_write;
+    }
+    if (res_write == ((ssize_t) 0)) {
+      /* Nothing written, stop trying */
+      return (ssize_t) already_written;
+    }
+    written_this_time = (size_t) res_write;
+    already_written += written_this_time;
+    to_be_written -= written_this_time;
+  }
+  return (ssize_t) already_written;
+}
+
 int main(int argc, char *argv[]) {
     if (argc != 4) {
         fprintf(stderr, "Usage: %s <TCP port> <UDP server name> <UDP port>\n", argv[0]);
-        exit(EXIT_FAILURE);
+        return -1;
     }
 
     uint16_t tcp_port;
     if (convert_port_name(&tcp_port, argv[1]) < 0) {
         fprintf(stderr, "Invalid TCP port: %s\n", argv[1]);
-        exit(EXIT_FAILURE);
+        return -1;
     }
 
     char *udp_server_name = argv[2];
     uint16_t udp_port;
     if (convert_port_name(&udp_port, argv[3]) < 0) {
         fprintf(stderr, "Invalid UDP port: %s\n", argv[3]);
-        exit(EXIT_FAILURE);
+        return -1;
     }
 
     // Create TCP socket
     int tcp_sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (tcp_sockfd < 0) {
-        handle_error("Failed to create TCP socket");
+        fprintf(stderr, "Could not open a UDP socket: %s\n", strerror(errno));
+        return -1;
     }
 
     struct sockaddr_in tcp_addr;
@@ -70,12 +96,14 @@ int main(int argc, char *argv[]) {
 
     // Bind TCP socket
     if (bind(tcp_sockfd, (struct sockaddr *)&tcp_addr, sizeof(tcp_addr)) < 0) {
-        handle_error("Failed to bind TCP socket");
+        fprintf(stderr, "Could not bind a socket: %s\n", strerror(errno));
+        return -1;
     }
 
     // Listen on TCP socket
     if (listen(tcp_sockfd, 1) < 0) {
-        handle_error("Failed to listen on TCP socket");
+        fprintf(stderr, "Failed to listen on TCP socket: %s\n", strerror(errno));
+        return -1;
     }
 
     // Get UDP socket
@@ -85,7 +113,8 @@ int main(int argc, char *argv[]) {
     hints.ai_socktype = SOCK_DGRAM;
 
     if (getaddrinfo(udp_server_name, argv[3], &hints, &udp_info) != 0) {
-        handle_error("Failed to get UDP address info");
+        fprintf(stderr, "Could not look up server address info for %s %s\n", udp_server_name, argv[3]);
+        return -1;
     }
 
     int udp_sockfd = -1;
@@ -97,7 +126,8 @@ int main(int argc, char *argv[]) {
         close(udp_sockfd);
     }
     if (p == NULL) {
-        handle_error("Failed to create UDP socket");
+        fprintf(stderr, "Failed to create UDP socket: %s\n", strerror(errno));
+        return -1;
     }
 
     freeaddrinfo(udp_info); // Free the linked list
@@ -107,16 +137,18 @@ int main(int argc, char *argv[]) {
     socklen_t client_len = sizeof(client_addr);
     int tcp_connfd = accept(tcp_sockfd, (struct sockaddr *)&client_addr, &client_len);
     if (tcp_connfd < 0) {
-        handle_error("Failed to accept TCP connection");
+        fprintf(stderr, "Failed to accept on TCP socket: %s\n", strerror(errno));
+        return -1;
     }
 
-    printf("Accepted a TCP connection\n");
+    write(1, "Accepted a TCP connection\n", 27);
 
     // Prepare for select()
     fd_set read_fds;
     char tcp_buffer[BUFFER_SIZE];
     char udp_buffer[UDP_BUFFER_SIZE];
 
+    int goterror = 0;
     while (1) {
         FD_ZERO(&read_fds);
         FD_SET(tcp_connfd, &read_fds);
@@ -125,44 +157,70 @@ int main(int argc, char *argv[]) {
 
         // Wait for data on either TCP or UDP sockets
         if (select(max_fd + 1, &read_fds, NULL, NULL, NULL) < 0) {
-            handle_error("select failed");
+            fprintf(stderr, "select failed: %s\n", strerror(errno));
+            goterror = 1;
+            break;
         }
 
         // Handle incoming data from TCP
         if (FD_ISSET(tcp_connfd, &read_fds)) {
             ssize_t bytes_received = read(tcp_connfd, tcp_buffer, BUFFER_SIZE);
             if (bytes_received < 0) {
-                handle_error("TCP Read failed");
+                fprintf(stderr, "TCP Read failed: %s\n", strerror(errno));
+                goterror = 1;
+                break;
             }
-            // Break if the connection is closed
+            // if the connection is closed
             if (bytes_received == 0) {
-                printf("TCP connection closed\n");
+                write(1, "TCP connection closed\n", 23);
+                fprintf(stderr, "TCP connection failed: %s\n", strerror(errno));
                 break; 
             }
-            
+
             if (send(udp_sockfd, tcp_buffer, bytes_received, 0) < 0) {
-                handle_error("UDP Send failed");
+                fprintf(stderr, "UDP send failed: %s\n", strerror(errno));
+                goterror = 1;
+                break;
             }
-            printf("Forwarded %zd bytes from TCP to UDP\n", bytes_received + 2);
+            write(1, "Forwarded bytes from TCP to UDP\n", 33);
+            // Write the received data to standard input. 
+            if (better_write(STDOUT_FILENO, tcp_buffer, bytes_received) < 0) {
+                fprintf(stderr, "write Error: %s\n", strerror(errno));
+                close(tcp_connfd);
+                return -1;
+            }
         }
 
         // Handle incoming data from UDP
         if (FD_ISSET(udp_sockfd, &read_fds)) {
             ssize_t bytes_received = recv(udp_sockfd, udp_buffer, UDP_BUFFER_SIZE, 0);
             if (bytes_received < 0) {
-                handle_error("UDP Receive failed");
+                fprintf(stderr, "UDP Receive failed: %s\n", strerror(errno));
+                goterror = 1;
+                break;
             }
 
             // Send the data over TCP
             if (send(tcp_connfd, udp_buffer, bytes_received, 0) < 0) {
-                handle_error("TCP Send failed");
+                fprintf(stderr, "TCP send failed: %s\n", strerror(errno));
+                goterror = 1;
+                break;
             }
-            printf("Forwarded %zd bytes from UDP to TCP\n", bytes_received);
+            write(1, "Forwarded bytes from UDP to TCP\n", 33);
+
+            // Write the received data to standard input. 
+            if (better_write(STDOUT_FILENO, udp_buffer, bytes_received) < 0) {
+                fprintf(stderr, "write Error: %s\n", strerror(errno));
+                close(udp_sockfd);
+                return -1;
+            }
         }
     }
 
+    // Cleanup
     close(tcp_connfd);
     close(tcp_sockfd);
     close(udp_sockfd);
+    if (goterror) {return -1;} // did not successed
     return 0;
 }
