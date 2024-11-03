@@ -6,9 +6,9 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 
-#define BUFFER_SIZE 216
+#define BUFFER_SIZE 65536
 
-// Helper function to convert the port name to a 16-bit unsigned integer
+// Function to convert the port name to a 16-bit unsigned integer
 static int convert_port_name(uint16_t *port, const char *port_name) {
     char *end;
     long long int nn;
@@ -28,25 +28,39 @@ static int convert_port_name(uint16_t *port, const char *port_name) {
     return 0;
 }
 
-// A wrapper around the write system call to ensure all bytes are written
-static ssize_t better_write(int fd, const void *buf, size_t count) {
-    ssize_t written, total_written = 0;
-    
-    while (count > 0) {
-        written = write(fd, buf + total_written, count);
-        if (written < 0) {
-            return -1;
-        }
-        total_written += written;
-        count -= written;
+ssize_t better_write(int fd, const char *buf, size_t count) {
+  size_t already_written, to_be_written, written_this_time, max_count;
+  ssize_t res_write;
+
+  if (count == ((size_t) 0)) return (ssize_t) count;
+  
+  already_written = (size_t) 0;
+  to_be_written = count;
+  while (to_be_written > ((size_t) 0)) {
+    max_count = to_be_written;
+    if (max_count > ((size_t) 8192)) {
+      max_count = (size_t) 8192;
     }
-    return total_written;
+    res_write = write(fd, &(((const char *) buf)[already_written]), max_count);
+    if (res_write < ((size_t) 0)) {
+      /* Error */
+      return res_write;
+    }
+    if (res_write == ((ssize_t) 0)) {
+      /* Nothing written, stop trying */
+      return (ssize_t) already_written;
+    }
+    written_this_time = (size_t) res_write;
+    already_written += written_this_time;
+    to_be_written -= written_this_time;
+  }
+  return (ssize_t) already_written;
 }
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <port>\n", argv[0]);
-        return EXIT_FAILURE;
+        return -1;
     }
 
     int sockfd;
@@ -58,53 +72,53 @@ int main(int argc, char *argv[]) {
     // Convert port name to 16-bit unsigned integer
     if (convert_port_name(&port, argv[1]) != 0) {
         fprintf(stderr, "Invalid port number: %s\n", argv[1]);
-        return EXIT_FAILURE;
+        return -1;
     }
 
     // Create UDP socket
     sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     if (sockfd < 0) {
-        perror("socket");
-        return EXIT_FAILURE;
+        fprintf(stderr, "Could not open a UDP socket: %s\n", strerror(errno));
+        return -1;
     }
 
-    // Zero out the server address structure and set the port and IP family
+    /* Bind the socket to an address and a port */
     memset(&servaddr, 0, sizeof(servaddr));
     servaddr.sin_family = AF_INET;
-    servaddr.sin_addr.s_addr = INADDR_ANY;  // Listen on any local interface
-    servaddr.sin_port = htons(port);  // Convert port to network byte order
+    servaddr.sin_addr.s_addr = INADDR_ANY;
+    servaddr.sin_port = htons(port);
 
-    // Bind the socket to the specified port
+    // Bind the socket to the port
     if (bind(sockfd, (const struct sockaddr *)&servaddr, sizeof(servaddr)) < 0) {
-        perror("bind");
+        fprintf(stderr, "Could not bind a socket: %s\n", strerror(errno));
         close(sockfd);
-        return EXIT_FAILURE;
+        return -1;
     }
 
     // Continuously receive packets until a 0-byte UDP packet is received
     while (1) {
         recv_bytes = recv(sockfd, buffer, BUFFER_SIZE, 0);
         if (recv_bytes < 0) {
-            perror("recv");
+            fprintf(stderr, "recv Error: %s\n", strerror(errno));
             close(sockfd);
-            return EXIT_FAILURE;
+            return -1;
         }
 
         // If a 0-byte packet is received, terminate the program
         if (recv_bytes == 0) {
-            printf("Received 0-byte packet. Terminating.\n");
+            better_write(1, "Received 0-byte packet. Terminating.\n", 38);
             break;
         }
 
-        // Write the received data to stdout
+        // Write the received data to standard input. 
         if (better_write(STDOUT_FILENO, buffer, recv_bytes) < 0) {
-            perror("write");
+            fprintf(stderr, "write Error: %s\n", strerror(errno));
             close(sockfd);
-            return EXIT_FAILURE;
+            return -1;
         }
     }
 
-    // Close the socket before exiting
+    // Close the socket
     close(sockfd);
-    return EXIT_SUCCESS;
+    return 0;
 }
