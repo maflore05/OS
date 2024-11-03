@@ -139,18 +139,17 @@ int main(int argc, char *argv[]) {
                 printf("TCP connection closed\n");
                 break; 
             }
+            
+            typedef struct {
+                uint16_t length;
+                char data[BUFFER_SIZE]; // Adjust size as needed
+            } udp_packet_t;
 
-            // Prepare the UDP packet
-            uint16_t udp_length = (uint16_t)bytes_received; // Length of the UDP payload
-            char udp_packet[UDP_BUFFER_SIZE];
+            udp_packet_t packet;
+            packet.length = htons((uint16_t)bytes_received); // Convert to network byte order
+            memcpy(packet.data, tcp_buffer, bytes_received);
 
-            // Fill the packet buffer with the length and the data
-            udp_packet[0] = (udp_length >> 8) & 0xFF;
-            udp_packet[1] = udp_length & 0xFF;
-            memcpy(udp_packet + 2, tcp_buffer, bytes_received); 
-
-            // Send the UDP packet
-            if (send(udp_sockfd, udp_packet, bytes_received + 2, 0) < 0) {
+            if (send(udp_sockfd, &packet, sizeof(packet.length) + bytes_received, 0) < 0) {
                 handle_error("UDP Send failed");
             }
             printf("Forwarded %zd bytes from TCP to UDP\n", bytes_received + 2);
