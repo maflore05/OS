@@ -140,16 +140,7 @@ int main(int argc, char *argv[]) {
                 break; 
             }
             
-            typedef struct {
-                uint16_t length;
-                char data[BUFFER_SIZE]; // Adjust size as needed
-            } udp_packet_t;
-
-            udp_packet_t packet;
-            packet.length = htons((uint16_t)bytes_received); // Convert to network byte order
-            memcpy(packet.data, tcp_buffer, bytes_received);
-
-            if (send(udp_sockfd, &packet, sizeof(packet.length) + bytes_received, 0) < 0) {
+            if (send(udp_sockfd, tcp_buffer, bytes_received, 0) < 0) {
                 handle_error("UDP Send failed");
             }
             printf("Forwarded %zd bytes from TCP to UDP\n", bytes_received + 2);
