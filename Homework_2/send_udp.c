@@ -10,12 +10,13 @@
 
 int main(int argc, char *argv[]) {
     if (argc < 3) {
-        fprintf(stderr, "Usage: %s <server_name> <port>\n", argv[0]);
-        return EXIT_FAILURE;
+        fprintf(stderr, "Arguments needed: <server_name> <port>\n");
+        return -1;
     }
 
     const char *server_name = argv[1];
     const char *port_name = argv[2];
+
     struct addrinfo hints, *result, *rp;
     int gai_code, sockfd;
     ssize_t bytes_read, bytes_sent;
@@ -23,16 +24,16 @@ int main(int argc, char *argv[]) {
 
     // Set up hints for getaddrinfo
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;         // IPv4
-    hints.ai_socktype = SOCK_DGRAM;    // UDP
-    hints.ai_protocol = 0;             // Any protocol
-    hints.ai_flags = 0;                // No flags
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_protocol = 0;
+    hints.ai_flags = 0;
 
     // Get the address info
     gai_code = getaddrinfo(server_name, port_name, &hints, &result);
     if (gai_code != 0) {
-        fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(gai_code));
-        return EXIT_FAILURE;
+        fprintf(stderr, "Could not look up server address info for %s %s\n", server_name, port_name);
+        return -1;
     }
 
     // Iterate over the results and create the socket
@@ -44,11 +45,11 @@ int main(int argc, char *argv[]) {
         break;
     }
 
-    // If socket creation failed for all address info results
+    // If socket creation failed, return error and free address
     if (rp == NULL) {
         fprintf(stderr, "Could not create socket: %s\n", strerror(errno));
         freeaddrinfo(result);
-        return EXIT_FAILURE;
+        return -1;
     }
 
     // Read from standard input and send to the server
@@ -59,7 +60,7 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "sendto: %s\n", strerror(errno));
             close(sockfd);
             freeaddrinfo(result);
-            return EXIT_FAILURE;
+            return -1;
         }
     }
 
@@ -68,7 +69,7 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "read: %s\n", strerror(errno));
         close(sockfd);
         freeaddrinfo(result);
-        return EXIT_FAILURE;
+        return -1;
     }
 
     // Send the 0-byte packet to signal the end of transmission
@@ -77,9 +78,9 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "sendto (end of transmission): %s\n", strerror(errno));
     }
 
-    // Clean up: close the socket and free the address info
+    // close the socket and free the address info
     close(sockfd);
     freeaddrinfo(result);
 
-    return EXIT_SUCCESS;
+    return 0;
 }
