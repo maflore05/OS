@@ -236,64 +236,118 @@
 
 /* Helper types and functions */
 
-/* YOUR HELPER FUNCTIONS GO HERE */
-
+/* File and Directory Structures */
 typedef struct myfs_file {
-    char *name;
-    size_t size;
-    time_t atime;
-    time_t mtime;
-    int is_directory; // 1 if directory, 0 if file
-    struct myfs_file *parent;
-    struct myfs_file *next;
-    struct myfs_file *children; // Linked list of child directories or files
+    char name[256];       // File name
+    size_t size;          // File size
+    time_t atime;         // Last access time
+    time_t mtime;         // Last modification time
+    mode_t mode;          // Permissions and type
 } myfs_file_t;
 
-/* Helper function: Find file or directory by path */
-myfs_file_t *myfs_traverse_path(myfs_file_t *root, const char *path) {
-    char *token, *path_copy;
-    myfs_file_t *current = root;
+typedef struct myfs_dir {
+    char name[256];        // Directory name
+    size_t subdirs_count;  // Number of subdirectories
+    size_t files_count;    // Number of files
+    struct myfs_dir *subdirs;  // Pointer to subdirectories
+    myfs_file_t *files;        // Pointer to files
+    time_t atime;          // Last access time
+    time_t mtime;          // Last modification time
+    mode_t mode;           // Permissions and type
+} myfs_dir_t;
 
-    if (path[0] == '/') {
-        current = root; // If path is absolute, start from root
+/* Helper: Parse path into components */
+char **parse_path(const char *path, size_t *count) {
+    if (!path || strcmp(path, "/") == 0) {
+        *count = 0;  // Root path
+        return NULL;
     }
 
-    path_copy = strdup(path); // Make a copy of the path so we can tokenize it
-    token = strtok(path_copy, "/");
+    char *path_copy = strdup(path);
+    if (!path_copy) {
+        *count = 0;
+        return NULL;
+    }
 
-    while (token != NULL) {
-        myfs_file_t *next = current->children;
-        while (next != NULL) {
-            if (strcmp(next->name, token) == 0) {
-                current = next;
-                break;
-            }
-            next = next->next;
-        }
+    size_t components = 0;
+    char *token = strtok(path_copy, "/");
+    char **result = malloc(256 * sizeof(char *));
+    if (!result) {
+        free(path_copy);
+        *count = 0;
+        return NULL;
+    }
 
-        if (next == NULL) {
-            free(path_copy);
-            return NULL; // Path not found
-        }
-
+    while (token) {
+        result[components++] = strdup(token);
         token = strtok(NULL, "/");
     }
 
     free(path_copy);
-    return current;
+    *count = components;
+    return result;
 }
 
-/* Helper function: Count subdirectories for a directory */
-int myfs_count_subdirectories(myfs_file_t *dir) {
-    int count = 0;
-    myfs_file_t *current = dir->children;
-    while (current != NULL) {
-        if (current->is_directory) {
-            count++;
-        }
-        current = current->next;
+/* Helper: Free parsed path components */
+void free_parsed_path(char **components, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        free(components[i]);
     }
-    return count + 2; // Include . and .. directories
+    free(components);
+}
+
+/* Find a node in the filesystem */
+void *myfs_find_node(void *fsptr, size_t fssize, const char *path, int *type) {
+    if (!fsptr || !path || !type) {
+        return NULL;
+    }
+
+    myfs_dir_t *root = (myfs_dir_t *)fsptr;
+    size_t path_count = 0;
+    char **path_components = parse_path(path, &path_count);
+
+    if (path_count == 0) { // Root directory case
+        *type = 1; // Directory
+        free_parsed_path(path_components, path_count);
+        return root;
+    }
+
+    myfs_dir_t *current_dir = root;
+    for (size_t i = 0; i < path_count; i++) {
+        int found = 0;
+
+        // Search subdirectories
+        for (size_t j = 0; j < current_dir->subdirs_count; j++) {
+            if (strcmp(current_dir->subdirs[j].name, path_components[i]) == 0) {
+                current_dir = &current_dir->subdirs[j];
+                found = 1;
+                break;
+            }
+        }
+
+        // If not found, search files if it's the last component
+        if (!found && i == path_count - 1) {
+            for (size_t k = 0; k < current_dir->files_count; k++) {
+                if (strcmp(current_dir->files[k].name, path_components[i]) == 0) {
+                    *type = 0; // File
+                    free_parsed_path(path_components, path_count);
+                    return &current_dir->files[k];
+                }
+            }
+        }
+
+        // If not found at all
+        if (!found) {
+            free_parsed_path(path_components, path_count);
+            *type = -1; // Not found
+            return NULL;
+        }
+    }
+
+    // If we've reached here, it's a directory
+    *type = 1; // Directory
+    free_parsed_path(path_components, path_count);
+    return current_dir;
 }
 
 /* End of helper functions */
@@ -327,42 +381,53 @@ int myfs_count_subdirectories(myfs_file_t *dir) {
 int __myfs_getattr_implem(void *fsptr, size_t fssize, int *errnoptr,
                           uid_t uid, gid_t gid,
                           const char *path, struct stat *stbuf) {
-    myfs_file_t *root = (myfs_file_t *)fsptr; // Assume fsptr is the root of the file system
-    myfs_file_t *entry = myfs_traverse_path(root, path);
-
-    if (entry == NULL) {
-        *errnoptr = ENOENT; // No such file or directory
+    if (!fsptr || !path || !stbuf) {
+        *errnoptr = EINVAL;
         return -1;
     }
 
-    // Set file type (regular file or directory)
-    if (entry->is_directory) {
-        stbuf->st_mode = S_IFDIR | 0755; // Directory with read/write/execute permissions
-    } else {
-        stbuf->st_mode = S_IFREG | 0755; // Regular file with read/write/execute permissions
+    memset(stbuf, 0, sizeof(struct stat)); // Initialize stbuf
+
+    if (is_root(path)) {
+        // Populate stat for root directory
+        stbuf->st_uid = uid;
+        stbuf->st_gid = gid;
+        stbuf->st_mode = S_IFDIR | 0755;
+        stbuf->st_nlink = 2; // . and ..
+        stbuf->st_atim.tv_sec = time(NULL);
+        stbuf->st_mtim.tv_sec = time(NULL);
+        return 0;
     }
 
-    // Set owner and group
-    stbuf->st_uid = uid;
-    stbuf->st_gid = gid;
+    int node_type;
+    void *node = myfs_find_node(fsptr, fssize, path, &node_type);
 
-    // Set number of hard links (1 for files, number of subdirectories for directories)
-    if (entry->is_directory) {
-        stbuf->st_nlink = myfs_count_subdirectories(entry);
-    } else {
+    if (!node) {
+        *errnoptr = ENOENT; // Path not found
+        return -1;
+    }
+
+    if (node_type == 1) { // Directory
+        myfs_dir_t *dir = (myfs_dir_t *)node;
+        stbuf->st_uid = uid;
+        stbuf->st_gid = gid;
+        stbuf->st_mode = S_IFDIR | 0755;
+        stbuf->st_nlink = dir->subdirs_count + 2; // . and ..
+        stbuf->st_atim.tv_sec = dir->atime;
+        stbuf->st_mtim.tv_sec = dir->mtime;
+    } else if (node_type == 0) { // File
+        myfs_file_t *file = (myfs_file_t *)node;
+        stbuf->st_uid = uid;
+        stbuf->st_gid = gid;
+        stbuf->st_mode = S_IFREG | 0755;
         stbuf->st_nlink = 1;
-    }
-
-    // Set file size (only for files)
-    if (entry->is_directory) {
-        stbuf->st_size = 0; // Directories don't have a size
+        stbuf->st_size = file->size;
+        stbuf->st_atim.tv_sec = file->atime;
+        stbuf->st_mtim.tv_sec = file->mtime;
     } else {
-        stbuf->st_size = entry->size; // For regular files, use actual size
+        *errnoptr = ENOENT;
+        return -1;
     }
-
-    // Set file times (access and modification)
-    stbuf->st_atim.tv_sec = entry->atime;
-    stbuf->st_mtim.tv_sec = entry->mtime;
 
     return 0;
 }
@@ -405,9 +470,83 @@ int __myfs_getattr_implem(void *fsptr, size_t fssize, int *errnoptr,
 */
 int __myfs_readdir_implem(void *fsptr, size_t fssize, int *errnoptr,
                           const char *path, char ***namesptr) {
-  /* STUB */
-  return -1;
+    if (!fsptr || !path || !errnoptr || !namesptr) {
+        if (errnoptr) *errnoptr = EINVAL; // Invalid argument
+        return -1;
+    }
+
+    myfs_dir_t *root_dir = (myfs_dir_t *)fsptr;
+
+    // If root directory is requested
+    myfs_dir_t *target_dir = NULL;
+    if (is_root(path)) {
+        target_dir = root_dir;
+    } else {
+        // Traverse the filesystem to find the target directory
+        int type;
+        target_dir = (myfs_dir_t *)myfs_find_node(fsptr, fssize, path, &type);
+        if (!target_dir) {
+            *errnoptr = ENOENT; // No such file or directory
+            return -1;
+        }
+        if (!(target_dir->mode & S_IFDIR)) {
+            *errnoptr = ENOTDIR; // Not a directory
+            return -1;
+        }
+    }
+
+    // Calculate the total entries (subdirectories + files)
+    size_t total_entries = target_dir->subdirs_count + target_dir->files_count;
+    if (total_entries == 0) {
+        *namesptr = NULL;
+        return 0;
+    }
+
+    // Allocate memory for the array of names
+    *namesptr = (char **)calloc(total_entries, sizeof(char *));
+    if (!*namesptr) {
+        *errnoptr = ENOMEM; // Memory allocation failure
+        return -1;
+    }
+
+    // Populate the names array with subdirectory names
+    size_t index = 0;
+    for (size_t i = 0; i < target_dir->subdirs_count; i++) {
+        myfs_dir_t *subdir = &target_dir->subdirs[i];
+        (*namesptr)[index] = (char *)calloc(strlen(subdir->name) + 1, sizeof(char));
+        if (!(*namesptr)[index]) {
+            // Free already-allocated memory
+            for (size_t j = 0; j < index; j++) free((*namesptr)[j]);
+            free(*namesptr);
+            *errnoptr = ENOMEM; // Memory allocation failure
+            return -1;
+        }
+        strcpy((*namesptr)[index], subdir->name);
+        index++;
+    }
+
+    // Populate the names array with file names
+    for (size_t i = 0; i < target_dir->files_count; i++) {
+        myfs_file_t *file = &target_dir->files[i];
+        (*namesptr)[index] = (char *)calloc(strlen(file->name) + 1, sizeof(char));
+        if (!(*namesptr)[index]) {
+            // Free already-allocated memory
+            for (size_t j = 0; j < index; j++) free((*namesptr)[j]);
+            free(*namesptr);
+            *errnoptr = ENOMEM; // Memory allocation failure
+            return -1;
+        }
+        strcpy((*namesptr)[index], file->name);
+        index++;
+    }
+
+    // Update the directory's access time
+    target_dir->atime = time(NULL);
+
+    // Return the number of entries
+    return total_entries;
 }
+
 
 /* Implements an emulation of the mknod system call for regular files
    on the filesystem of size fssize pointed to by fsptr.
@@ -426,6 +565,7 @@ int __myfs_readdir_implem(void *fsptr, size_t fssize, int *errnoptr,
    The error codes are documented in man 2 mknod.
 
 */
+
 int __myfs_mknod_implem(void *fsptr, size_t fssize, int *errnoptr,
                         const char *path) {
   /* STUB */
