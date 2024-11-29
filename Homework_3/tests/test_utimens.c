@@ -19,68 +19,85 @@ typedef struct myfs_file {
     time_t mtime;
     time_t ctime;
     int is_directory;
-    struct myfs_file *parent;
-    struct myfs_file *next;
-    struct myfs_file *children;
+    size_t parent_offset;
+    size_t next_offset;
+    size_t children_offset;
 } myfs_file_t;
 
-myfs_file_t *myfs_traverse_path(myfs_file_t *root, const char *path);
+size_t myfs_traverse_path(void *fsptr, const char *path);
 int __myfs_utimens_implem(void *fsptr, size_t fssize, int *errnoptr,
                           const char *path, const struct timespec ts[2]);
 
-myfs_file_t *myfs_traverse_path(myfs_file_t *root, const char *path) {
-    char *token, *path_copy;
-    myfs_file_t *current = root;
-
-    if (path[0] == '/') {
-        current = root;
+size_t myfs_traverse_path(void *fsptr, const char *path) {
+    if (!fsptr || !path || path[0] == '\0') {
+        return (size_t)-1;
     }
 
-    path_copy = strdup(path);
-    token = strtok(path_copy, "/");
+    char *path_copy = strdup(path);
+    if (!path_copy) {
+        return (size_t)-1;
+    }
+
+    char *token = strtok(path_copy, "/");
+    size_t current_offset = 0;
 
     while (token != NULL) {
-        myfs_file_t *next = current->children;
+        myfs_file_t *current = (myfs_file_t *)((char *)fsptr + current_offset);
+        size_t next_offset = current->children_offset;
+        myfs_file_t *next = (next_offset != 0) ? (myfs_file_t *)((char *)fsptr + next_offset) : NULL;
+
+        int found = 0;
         while (next != NULL) {
             if (strcmp(next->name, token) == 0) {
-                current = next;
+                current_offset = next_offset;
+                found = 1;
                 break;
             }
-            next = next->next;
+            next_offset = next->next_offset;
+            next = (next_offset != 0) ? (myfs_file_t *)((char *)fsptr + next_offset) : NULL;
         }
 
-        if (next == NULL) {
+        if (!found) {
             free(path_copy);
-            return NULL;
+            return (size_t)-1;
         }
 
         token = strtok(NULL, "/");
     }
 
     free(path_copy);
-    return current;
+    return current_offset;
 }
 
 int __myfs_utimens_implem(void *fsptr, size_t fssize, int *errnoptr,
                           const char *path, const struct timespec ts[2]) {
-    if (!fsptr || !path || !errnoptr) {
-        *errnoptr = EFAULT;
+    if (!fsptr || fssize <= 0 || !path || !errnoptr) {
+        if (errnoptr) *errnoptr = EFAULT;
         return -1;
     }
 
-    if (strlen(path) == 0) {
+    if (strlen(path) == 0 || strcmp(path, "/") == 0) {
+        *errnoptr = EINVAL;
+        return -1;
+    }
+
+    size_t file_offset = myfs_traverse_path(fsptr, path);
+    if (file_offset == (size_t)-1) {
         *errnoptr = ENOENT;
         return -1;
     }
 
-    myfs_file_t *file = myfs_traverse_path((myfs_file_t *)fsptr, path);
-    if (!file) {
-        *errnoptr = ENOENT;
+    myfs_file_t *file = (myfs_file_t *)((char *)fsptr + file_offset);
+
+    if (file->is_directory) {
+        *errnoptr = EISDIR;
         return -1;
     }
 
     time_t now = time(NULL);
-    if (ts) {
+    if (!ts) {
+        file->atime = file->mtime = now;
+    } else {
         for (int i = 0; i < 2; i++) {
             if (ts[i].tv_nsec != UTIME_NOW && ts[i].tv_nsec != UTIME_OMIT &&
                 (ts[i].tv_nsec < 0 || ts[i].tv_nsec >= 1000000000)) {
@@ -95,30 +112,37 @@ int __myfs_utimens_implem(void *fsptr, size_t fssize, int *errnoptr,
         if (ts[1].tv_nsec != UTIME_OMIT) {
             file->mtime = (ts[1].tv_nsec == UTIME_NOW) ? now : ts[1].tv_sec;
         }
-    } else {
-        file->atime = file->mtime = now;
     }
 
     file->ctime = now;
     return 0;
 }
 
-void setup_mock_filesystem(myfs_file_t *root) {
-    myfs_file_t *file1 = (myfs_file_t *)malloc(sizeof(myfs_file_t));
+void setup_mock_filesystem(void *fsptr) {
+    myfs_file_t *root = (myfs_file_t *)fsptr;
+
+    root->name = strdup("/");
+    root->size = 0;
+    root->is_directory = 1;
+    root->parent_offset = 0;
+    root->next_offset = 0;
+    root->children_offset = sizeof(myfs_file_t);
+
+    myfs_file_t *file1 = (myfs_file_t *)((char *)fsptr + root->children_offset);
     file1->name = strdup("file1");
     file1->size = 10;
     file1->is_directory = 0;
-    file1->atime = file1->mtime = file1->ctime = time(NULL);
-    file1->parent = root;
-    file1->next = NULL;
-    file1->children = NULL;
-
-    root->children = file1;
+    file1->parent_offset = 0;
+    file1->next_offset = 0;
+    file1->children_offset = 0;
 }
 
 void test_utimens() {
-    myfs_file_t root = {"/", 0, time(NULL), time(NULL), time(NULL), 1, NULL, NULL, NULL};
-    setup_mock_filesystem(&root);
+    size_t fssize = 1024;
+    void *fsptr = malloc(fssize);
+    memset(fsptr, 0, fssize);
+
+    setup_mock_filesystem(fsptr);
 
     int err;
     struct timespec ts[2];
@@ -129,7 +153,7 @@ void test_utimens() {
     ts[1].tv_nsec = 0;
 
     printf("Test 1: Update 'file1' timestamps\n");
-    int result = __myfs_utimens_implem(&root, 1024, &err, "file1", ts);
+    int result = __myfs_utimens_implem(fsptr, fssize, &err, "file1", ts);
     if (result == 0) {
         printf("Success: Timestamps updated for 'file1'\n");
     } else {
@@ -142,7 +166,7 @@ void test_utimens() {
     ts[1].tv_nsec = UTIME_NOW;
 
     printf("\nTest 2: Update 'file1' with UTIME_NOW\n");
-    result = __myfs_utimens_implem(&root, 1024, &err, "file1", ts);
+    result = __myfs_utimens_implem(fsptr, fssize, &err, "file1", ts);
     if (result == 0) {
         printf("Success: Timestamps updated with UTIME_NOW for 'file1'\n");
     } else {
@@ -150,12 +174,14 @@ void test_utimens() {
     }
 
     printf("\nTest 3: Update non-existent file\n");
-    result = __myfs_utimens_implem(&root, 1024, &err, "nonexistent", ts);
+    result = __myfs_utimens_implem(fsptr, fssize, &err, "nonexistent", ts);
     if (result == -1 && err == ENOENT) {
         printf("Success: Non-existent file handled correctly\n");
     } else {
         printf("Unexpected result: %d, errno: %d\n", result, err);
     }
+
+    free(fsptr);
 }
 
 int main() {
