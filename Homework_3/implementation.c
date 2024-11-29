@@ -95,6 +95,25 @@
    accumulate over time. In a working setup, a FUSE process is
    supposed to run for a long time!
 
+   It is possible to check for memory leaks by running the FUSE
+   process inside valgrind:
+
+   valgrind --leak-check=full ./myfs --backupfile=test.myfs ~/fuse-mnt/ -f
+
+   However, the analysis of the leak indications displayed by valgrind
+   is difficult as libfuse contains some small memory leaks (which do
+   not accumulate over time). We cannot (easily) fix these memory
+   leaks inside libfuse.
+
+   * Avoid putting debug messages into the code. You may use fprintf
+   for debugging purposes but they should all go away in the final
+   version of the code. Using gdb is more professional, though.
+
+   * You MUST NOT fail with exit(1) in case of an error. All the
+   functions you have to implement have ways to indicated failure
+   cases. Use these, mapping your internal errors intelligently onto
+   the POSIX error conditions.
+
    * And of course: your code MUST NOT SEGFAULT!
 
    It is reasonable to proceed in the following order:
@@ -140,6 +159,78 @@
 
          and check that they start to exist (with the appropriate
          access/modification times) with ls -la.
+
+   (7)   Design and implement __myfs_mkdir_implem. Test as above.
+
+   (8)   Design and implement __myfs_truncate_implem. You can now 
+         create files filled with zeros:
+
+         truncate -s 1024 foo
+
+   (9)   Design and implement __myfs_statfs_implem. Test by running
+         df before and after the truncation of a file to various lengths. 
+         The free "disk" space must change accordingly.
+
+   (10)  Design, implement and test __myfs_utimens_implem. You can now 
+         touch files at different dates (in the past, in the future).
+
+   (11)  Design and implement __myfs_open_implem. The function can 
+         only be tested once __myfs_read_implem and __myfs_write_implem are
+         implemented.
+
+   (12)  Design, implement and test __myfs_read_implem and
+         __myfs_write_implem. You can now write to files and read the data 
+         back:
+
+         echo "Hello world" > foo
+         echo "Hallo ihr da" >> foo
+         cat foo
+
+         Be sure to test the case when you unmount and remount the
+         filesystem: the files must still be there, contain the same
+         information and have the same access and/or modification
+         times.
+
+   (13)  Design, implement and test __myfs_unlink_implem. You can now
+         remove files.
+
+   (14)  Design, implement and test __myfs_unlink_implem. You can now
+         remove directories.
+
+   (15)  Design, implement and test __myfs_rename_implem. This function
+         is extremely complicated to implement. Be sure to cover all 
+         cases that are documented in man 2 rename. The case when the 
+         new path exists already is really hard to implement. Be sure to 
+         never leave the filessystem in a bad state! Test thoroughly 
+         using mv on (filled and empty) directories and files onto 
+         inexistant and already existing directories and files.
+
+   (16)  Design, implement and test any function that your instructor
+         might have left out from this list. There are 13 functions 
+         __myfs_XXX_implem you have to write.
+
+   (17)  Go over all functions again, testing them one-by-one, trying
+         to exercise all special conditions (error conditions): set
+         breakpoints in gdb and use a sequence of bash commands inside
+         your mounted filesystem to trigger these special cases. Be
+         sure to cover all funny cases that arise when the filesystem
+         is full but files are supposed to get written to or truncated
+         to longer length. There must not be any segfault; the user
+         space program using your filesystem just has to report an
+         error. Also be sure to unmount and remount your filesystem,
+         in order to be sure that it contents do not change by
+         unmounting and remounting. Try to mount two of your
+         filesystems at different places and copy and move (rename!)
+         (heavy) files (your favorite movie or song, an image of a cat
+         etc.) from one mount-point to the other. None of the two FUSE
+         processes must provoke errors. Find ways to test the case
+         when files have holes as the process that wrote them seeked
+         beyond the end of the file several times. Your filesystem must
+         support these operations at least by making the holes explicit 
+         zeros (use dd to test this aspect).
+
+   (18)  Run some heavy testing: copy your favorite movie into your
+         filesystem and try to watch it out of the filesystem.
 
 */
 
