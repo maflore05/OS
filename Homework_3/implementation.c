@@ -95,25 +95,6 @@
    accumulate over time. In a working setup, a FUSE process is
    supposed to run for a long time!
 
-   It is possible to check for memory leaks by running the FUSE
-   process inside valgrind:
-
-   valgrind --leak-check=full ./myfs --backupfile=test.myfs ~/fuse-mnt/ -f
-
-   However, the analysis of the leak indications displayed by valgrind
-   is difficult as libfuse contains some small memory leaks (which do
-   not accumulate over time). We cannot (easily) fix these memory
-   leaks inside libfuse.
-
-   * Avoid putting debug messages into the code. You may use fprintf
-   for debugging purposes but they should all go away in the final
-   version of the code. Using gdb is more professional, though.
-
-   * You MUST NOT fail with exit(1) in case of an error. All the
-   functions you have to implement have ways to indicated failure
-   cases. Use these, mapping your internal errors intelligently onto
-   the POSIX error conditions.
-
    * And of course: your code MUST NOT SEGFAULT!
 
    It is reasonable to proceed in the following order:
@@ -160,194 +141,86 @@
          and check that they start to exist (with the appropriate
          access/modification times) with ls -la.
 
-   (7)   Design and implement __myfs_mkdir_implem. Test as above.
-
-   (8)   Design and implement __myfs_truncate_implem. You can now 
-         create files filled with zeros:
-
-         truncate -s 1024 foo
-
-   (9)   Design and implement __myfs_statfs_implem. Test by running
-         df before and after the truncation of a file to various lengths. 
-         The free "disk" space must change accordingly.
-
-   (10)  Design, implement and test __myfs_utimens_implem. You can now 
-         touch files at different dates (in the past, in the future).
-
-   (11)  Design and implement __myfs_open_implem. The function can 
-         only be tested once __myfs_read_implem and __myfs_write_implem are
-         implemented.
-
-   (12)  Design, implement and test __myfs_read_implem and
-         __myfs_write_implem. You can now write to files and read the data 
-         back:
-
-         echo "Hello world" > foo
-         echo "Hallo ihr da" >> foo
-         cat foo
-
-         Be sure to test the case when you unmount and remount the
-         filesystem: the files must still be there, contain the same
-         information and have the same access and/or modification
-         times.
-
-   (13)  Design, implement and test __myfs_unlink_implem. You can now
-         remove files.
-
-   (14)  Design, implement and test __myfs_unlink_implem. You can now
-         remove directories.
-
-   (15)  Design, implement and test __myfs_rename_implem. This function
-         is extremely complicated to implement. Be sure to cover all 
-         cases that are documented in man 2 rename. The case when the 
-         new path exists already is really hard to implement. Be sure to 
-         never leave the filessystem in a bad state! Test thoroughly 
-         using mv on (filled and empty) directories and files onto 
-         inexistant and already existing directories and files.
-
-   (16)  Design, implement and test any function that your instructor
-         might have left out from this list. There are 13 functions 
-         __myfs_XXX_implem you have to write.
-
-   (17)  Go over all functions again, testing them one-by-one, trying
-         to exercise all special conditions (error conditions): set
-         breakpoints in gdb and use a sequence of bash commands inside
-         your mounted filesystem to trigger these special cases. Be
-         sure to cover all funny cases that arise when the filesystem
-         is full but files are supposed to get written to or truncated
-         to longer length. There must not be any segfault; the user
-         space program using your filesystem just has to report an
-         error. Also be sure to unmount and remount your filesystem,
-         in order to be sure that it contents do not change by
-         unmounting and remounting. Try to mount two of your
-         filesystems at different places and copy and move (rename!)
-         (heavy) files (your favorite movie or song, an image of a cat
-         etc.) from one mount-point to the other. None of the two FUSE
-         processes must provoke errors. Find ways to test the case
-         when files have holes as the process that wrote them seeked
-         beyond the end of the file several times. Your filesystem must
-         support these operations at least by making the holes explicit 
-         zeros (use dd to test this aspect).
-
-   (18)  Run some heavy testing: copy your favorite movie into your
-         filesystem and try to watch it out of the filesystem.
-
 */
 
 /* Helper types and functions */
 
-/* File and Directory Structures */
-typedef struct myfs_file {
-    char name[256];       // File name
-    size_t size;          // File size
-    time_t atime;         // Last access time
-    time_t mtime;         // Last modification time
-    mode_t mode;          // Permissions and type
-} myfs_file_t;
+#define NAME_MAX_LEN 255
+#define BLOCK_SIZE 1024
 
-typedef struct myfs_dir {
-    char name[256];        // Directory name
-    size_t subdirs_count;  // Number of subdirectories
-    size_t files_count;    // Number of files
-    struct myfs_dir *subdirs;  // Pointer to subdirectories
-    myfs_file_t *files;        // Pointer to files
-    time_t atime;          // Last access time
-    time_t mtime;          // Last modification time
-    mode_t mode;           // Permissions and type
-} myfs_dir_t;
+typedef size_t myfs_off_t;
 
-/* Helper: Parse path into components */
-char **parse_path(const char *path, size_t *count) {
-    if (!path || strcmp(path, "/") == 0) {
-        *count = 0;  // Root path
-        return NULL;
+struct myfs_super {
+    uint32_t magic;
+    myfs_off_t root_dir;
+    myfs_off_t free_memory;
+    size_t size;
+};
+
+struct myfs_file {
+    size_t size;
+    size_t allocated;
+    myfs_off_t data;
+    myfs_off_t next_file_block;
+};
+
+struct myfs_dir {
+    size_t number_children;
+    myfs_off_t children;
+};
+
+struct myfs_node {
+    char name[NAME_MAX_LEN + 1];
+    char is_file;
+    struct timespec times[2];
+    union {
+        struct myfs_file file;
+        struct myfs_dir directory;
+    } data;
+};
+
+static void *off_to_ptr(void *fsptr, myfs_off_t offset) {
+    return (char *)fsptr + offset;
+}
+
+static myfs_off_t ptr_to_off(void *fsptr, void *ptr) {
+    return (myfs_off_t)((char *)ptr - (char *)fsptr);
+}
+
+static struct myfs_node *find_node(void *fsptr, const char *path) {
+    struct myfs_super *super = (struct myfs_super *)fsptr;
+    struct myfs_node *current = off_to_ptr(fsptr, super->root_dir);
+
+    if (strcmp(path, "/") == 0) {
+        return current;
     }
 
     char *path_copy = strdup(path);
-    if (!path_copy) {
-        *count = 0;
-        return NULL;
-    }
-
-    size_t components = 0;
     char *token = strtok(path_copy, "/");
-    char **result = malloc(256 * sizeof(char *));
-    if (!result) {
-        free(path_copy);
-        *count = 0;
-        return NULL;
-    }
 
-    while (token) {
-        result[components++] = strdup(token);
-        token = strtok(NULL, "/");
-    }
-
-    free(path_copy);
-    *count = components;
-    return result;
-}
-
-/* Helper: Free parsed path components */
-void free_parsed_path(char **components, size_t count) {
-    for (size_t i = 0; i < count; i++) {
-        free(components[i]);
-    }
-    free(components);
-}
-
-/* Find a node in the filesystem */
-void *myfs_find_node(void *fsptr, size_t fssize, const char *path, int *type) {
-    if (!fsptr || !path || !type) {
-        return NULL;
-    }
-
-    myfs_dir_t *root = (myfs_dir_t *)fsptr;
-    size_t path_count = 0;
-    char **path_components = parse_path(path, &path_count);
-
-    if (path_count == 0) { // Root directory case
-        *type = 1; // Directory
-        free_parsed_path(path_components, path_count);
-        return root;
-    }
-
-    myfs_dir_t *current_dir = root;
-    for (size_t i = 0; i < path_count; i++) {
+    while (token != NULL) {
         int found = 0;
+        myfs_off_t *children = off_to_ptr(fsptr, current->data.directory.children);
 
-        // Search subdirectories
-        for (size_t j = 0; j < current_dir->subdirs_count; j++) {
-            if (strcmp(current_dir->subdirs[j].name, path_components[i]) == 0) {
-                current_dir = &current_dir->subdirs[j];
+        for (size_t i = 0; i < current->data.directory.number_children; i++) {
+            struct myfs_node *child = off_to_ptr(fsptr, children[i]);
+            if (strcmp(child->name, token) == 0) {
+                current = child;
                 found = 1;
                 break;
             }
         }
 
-        // If not found, search files if it's the last component
-        if (!found && i == path_count - 1) {
-            for (size_t k = 0; k < current_dir->files_count; k++) {
-                if (strcmp(current_dir->files[k].name, path_components[i]) == 0) {
-                    *type = 0; // File
-                    free_parsed_path(path_components, path_count);
-                    return &current_dir->files[k];
-                }
-            }
-        }
-
-        // If not found at all
         if (!found) {
-            free_parsed_path(path_components, path_count);
-            *type = -1; // Not found
+            free(path_copy);
             return NULL;
         }
+
+        token = strtok(NULL, "/");
     }
 
-    // If we've reached here, it's a directory
-    *type = 1; // Directory
-    free_parsed_path(path_components, path_count);
-    return current_dir;
+    free(path_copy);
+    return current;
 }
 
 /* End of helper functions */
@@ -381,52 +254,27 @@ void *myfs_find_node(void *fsptr, size_t fssize, const char *path, int *type) {
 int __myfs_getattr_implem(void *fsptr, size_t fssize, int *errnoptr,
                           uid_t uid, gid_t gid,
                           const char *path, struct stat *stbuf) {
-    if (!fsptr || !path || !stbuf) {
-        *errnoptr = EINVAL;
-        return -1;
-    }
-
-    memset(stbuf, 0, sizeof(struct stat)); // Initialize stbuf
-
-    if (is_root(path)) {
-        // Populate stat for root directory
-        stbuf->st_uid = uid;
-        stbuf->st_gid = gid;
-        stbuf->st_mode = S_IFDIR | 0755;
-        stbuf->st_nlink = 2; // . and ..
-        stbuf->st_atim.tv_sec = time(NULL);
-        stbuf->st_mtim.tv_sec = time(NULL);
-        return 0;
-    }
-
-    int node_type;
-    void *node = myfs_find_node(fsptr, fssize, path, &node_type);
-
-    if (!node) {
-        *errnoptr = ENOENT; // Path not found
-        return -1;
-    }
-
-    if (node_type == 1) { // Directory
-        myfs_dir_t *dir = (myfs_dir_t *)node;
-        stbuf->st_uid = uid;
-        stbuf->st_gid = gid;
-        stbuf->st_mode = S_IFDIR | 0755;
-        stbuf->st_nlink = dir->subdirs_count + 2; // . and ..
-        stbuf->st_atim.tv_sec = dir->atime;
-        stbuf->st_mtim.tv_sec = dir->mtime;
-    } else if (node_type == 0) { // File
-        myfs_file_t *file = (myfs_file_t *)node;
-        stbuf->st_uid = uid;
-        stbuf->st_gid = gid;
-        stbuf->st_mode = S_IFREG | 0755;
-        stbuf->st_nlink = 1;
-        stbuf->st_size = file->size;
-        stbuf->st_atim.tv_sec = file->atime;
-        stbuf->st_mtim.tv_sec = file->mtime;
-    } else {
+    struct myfs_node *node = find_node(fsptr, path);
+    if (node == NULL) {
         *errnoptr = ENOENT;
         return -1;
+    }
+
+    memset(stbuf, 0, sizeof(struct stat));
+    stbuf->st_uid = uid;
+    stbuf->st_gid = gid;
+    stbuf->st_atime = node->times[0].tv_sec;
+    stbuf->st_mtime = node->times[1].tv_sec;
+    stbuf->st_ctime = node->times[1].tv_sec;
+
+    if (node->is_file) {
+        stbuf->st_mode = S_IFREG | 0644;
+        stbuf->st_nlink = 1;
+        stbuf->st_size = node->data.file.size;
+    } else {
+        stbuf->st_mode = S_IFDIR | 0755;
+        stbuf->st_nlink = 2;
+        stbuf->st_size = 0;
     }
 
     return 0;
@@ -470,83 +318,35 @@ int __myfs_getattr_implem(void *fsptr, size_t fssize, int *errnoptr,
 */
 int __myfs_readdir_implem(void *fsptr, size_t fssize, int *errnoptr,
                           const char *path, char ***namesptr) {
-    if (!fsptr || !path || !errnoptr || !namesptr) {
-        if (errnoptr) *errnoptr = EINVAL; // Invalid argument
+    struct myfs_node *dir_node = find_node(fsptr, path);
+    if (dir_node == NULL || dir_node->is_file) {
+        *errnoptr = ENOENT;
         return -1;
     }
 
-    myfs_dir_t *root_dir = (myfs_dir_t *)fsptr;
-
-    // If root directory is requested
-    myfs_dir_t *target_dir = NULL;
-    if (is_root(path)) {
-        target_dir = root_dir;
-    } else {
-        // Traverse the filesystem to find the target directory
-        int type;
-        target_dir = (myfs_dir_t *)myfs_find_node(fsptr, fssize, path, &type);
-        if (!target_dir) {
-            *errnoptr = ENOENT; // No such file or directory
-            return -1;
-        }
-        if (!(target_dir->mode & S_IFDIR)) {
-            *errnoptr = ENOTDIR; // Not a directory
-            return -1;
-        }
-    }
-
-    // Calculate the total entries (subdirectories + files)
-    size_t total_entries = target_dir->subdirs_count + target_dir->files_count;
-    if (total_entries == 0) {
-        *namesptr = NULL;
-        return 0;
-    }
-
-    // Allocate memory for the array of names
-    *namesptr = (char **)calloc(total_entries, sizeof(char *));
-    if (!*namesptr) {
-        *errnoptr = ENOMEM; // Memory allocation failure
+    size_t count = dir_node->data.directory.number_children;
+    *namesptr = calloc(count, sizeof(char *));
+    if (*namesptr == NULL) {
+        *errnoptr = ENOMEM;
         return -1;
     }
 
-    // Populate the names array with subdirectory names
-    size_t index = 0;
-    for (size_t i = 0; i < target_dir->subdirs_count; i++) {
-        myfs_dir_t *subdir = &target_dir->subdirs[i];
-        (*namesptr)[index] = (char *)calloc(strlen(subdir->name) + 1, sizeof(char));
-        if (!(*namesptr)[index]) {
-            // Free already-allocated memory
-            for (size_t j = 0; j < index; j++) free((*namesptr)[j]);
+    myfs_off_t *children = off_to_ptr(fsptr, dir_node->data.directory.children);
+    for (size_t i = 0; i < count; i++) {
+        struct myfs_node *child = off_to_ptr(fsptr, children[i]);
+        (*namesptr)[i] = strdup(child->name);
+        if ((*namesptr)[i] == NULL) {
+            for (size_t j = 0; j < i; j++) {
+                free((*namesptr)[j]);
+            }
             free(*namesptr);
-            *errnoptr = ENOMEM; // Memory allocation failure
+            *errnoptr = ENOMEM;
             return -1;
         }
-        strcpy((*namesptr)[index], subdir->name);
-        index++;
     }
 
-    // Populate the names array with file names
-    for (size_t i = 0; i < target_dir->files_count; i++) {
-        myfs_file_t *file = &target_dir->files[i];
-        (*namesptr)[index] = (char *)calloc(strlen(file->name) + 1, sizeof(char));
-        if (!(*namesptr)[index]) {
-            // Free already-allocated memory
-            for (size_t j = 0; j < index; j++) free((*namesptr)[j]);
-            free(*namesptr);
-            *errnoptr = ENOMEM; // Memory allocation failure
-            return -1;
-        }
-        strcpy((*namesptr)[index], file->name);
-        index++;
-    }
-
-    // Update the directory's access time
-    target_dir->atime = time(NULL);
-
-    // Return the number of entries
-    return total_entries;
+    return count;
 }
-
 
 /* Implements an emulation of the mknod system call for regular files
    on the filesystem of size fssize pointed to by fsptr.
@@ -565,12 +365,11 @@ int __myfs_readdir_implem(void *fsptr, size_t fssize, int *errnoptr,
    The error codes are documented in man 2 mknod.
 
 */
-
-int __myfs_mknod_implem(void *fsptr, size_t fssize, int *errnoptr,
-                        const char *path) {
-  /* STUB */
+int __myfs_mknod_implem(void *fsptr, size_t fssize, int *errnoptr, const char *path) {
+    /* STUB */
   return -1;
 }
+
 
 /* Implements an emulation of the unlink system call for regular files
    on the filesystem of size fssize pointed to by fsptr.
