@@ -223,6 +223,79 @@ static struct myfs_node *find_node(void *fsptr, const char *path) {
     return current;
 }
 
+// A combination of previous file
+
+static void update_time(struct myfs_node *node, int set_mod) {
+    if (node == NULL) {
+        return;
+    }
+
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_REALTIME, &ts) == 0) {
+        node->times[0] = ts;
+        if (set_mod) {
+            node->times[1] = ts;
+        }
+    }
+}
+
+
+static struct myfs_node *find_parent_node(void *fsptr, const char *path, char **last_token) {
+    struct myfs_super *super = (struct myfs_super *)fsptr;
+    struct myfs_node *current = off_to_ptr(fsptr, super->root_dir);
+
+    if (strcmp(path, "/") == 0) {
+        *last_token = strdup("");
+        return current;
+    }
+
+    char *path_copy = strdup(path);
+    char *token = strtok(path_copy, "/");
+    char *prev_token = NULL;
+
+    while (token != NULL) {
+        prev_token = token;
+        token = strtok(NULL, "/");
+
+        if (token == NULL) {
+            break;
+        }
+
+        int found = 0;
+        myfs_off_t *children = off_to_ptr(fsptr, current->data.directory.children);
+
+        for (size_t i = 0; i < current->data.directory.number_children; i++) {
+            struct myfs_node *child = off_to_ptr(fsptr, children[i]);
+            if (strcmp(child->name, token) == 0) {
+                current = child;
+                found = 1;
+                break;
+            }
+        }
+
+        if (!found) {
+            free(path_copy);
+            return NULL;
+        }
+    }
+
+    *last_token = strdup(prev_token);
+    free(path_copy);
+    return current;
+}
+
+static struct myfs_node *get_node(void *fsptr, struct myfs_dir *dir, const char *name) {
+    myfs_off_t *children = off_to_ptr(fsptr, dir->children);
+    for (size_t i = 0; i < dir->number_children; i++) {
+        struct myfs_node *child = off_to_ptr(fsptr, children[i]);
+        if (strcmp(child->name, name) == 0) {
+            return child;
+        }
+    }
+    return NULL;
+}
+
 /* End of helper functions */
 
 /* Implements an emulation of the stat system call on the filesystem 
@@ -366,9 +439,144 @@ int __myfs_readdir_implem(void *fsptr, size_t fssize, int *errnoptr,
 
 */
 int __myfs_mknod_implem(void *fsptr, size_t fssize, int *errnoptr, const char *path) {
-    /* STUB */
-  return -1;
+    struct myfs_super *super = (struct myfs_super *)fsptr;
+    struct myfs_super *super_copy = (struct myfs_super *)fsptr;
+
+    // Initialize the file system if not already initialized
+    if (super->magic != 0xCAFEBABE) {
+        super->magic = 0xCAFEBABE;
+        super->size = fssize;
+        super->root_dir = sizeof(struct myfs_super);
+
+        struct myfs_node *root = off_to_ptr(fsptr, super->root_dir);
+        memset(root->name, '\0', NAME_MAX_LEN + 1);
+        strcpy(root->name, "/");
+        update_time(root, 1);
+        root->is_file = 0;
+
+        root->data.directory.number_children = 0;
+        myfs_off_t *children = off_to_ptr(fsptr, super->root_dir + sizeof(struct myfs_node));
+        *children = 0;
+        root->data.directory.children = ptr_to_off(fsptr, children);
+
+        super->free_memory = ptr_to_off(fsptr, children + 1);
+        myfs_off_t *free_memory = off_to_ptr(fsptr, super->free_memory);
+        *free_memory = fssize - super->free_memory - sizeof(size_t);
+    }
+
+    struct myfs_node *parent_node;
+    char *last_token;
+    parent_node = find_parent_node(fsptr, path, &last_token);
+    if (parent_node == NULL) {
+        *errnoptr = ENOENT;
+        free(last_token);
+        return -1;
+    }
+
+    if (parent_node->is_file) {
+        *errnoptr = ENOTDIR;
+        free(last_token);
+        return -1;
+    }
+
+    struct myfs_node *existing_node = get_node(fsptr, &parent_node->data.directory, last_token);
+    if (existing_node != NULL) {
+        *errnoptr = EEXIST;
+        free(last_token);
+        return -1;
+    }
+
+    if (strlen(last_token) > NAME_MAX_LEN) {
+        *errnoptr = ENAMETOOLONG;
+        free(last_token);
+        return -1;
+    }
+
+    // Step 1: Validate path
+    if (strcmp(path, "/") == 0) {
+        *errnoptr = EINVAL; // Cannot create a file named "/"
+        return -1;
+    }
+
+    // Check if file already exists
+    if (find_node(fsptr, path) != NULL) {
+        *errnoptr = EEXIST;
+        return -1;
+    }
+
+    // Step 2: Find parent directory
+    char *path_copy = strdup(path);
+    if (path_copy == NULL) {
+        *errnoptr = ENOMEM;
+        return -1;
+    }
+
+    char *save_name = strrchr(path_copy, '/');
+    save_name++; // Move to the name
+    char actual_name[NAME_MAX_LEN];
+    strncpy(actual_name, save_name, NAME_MAX_LEN);
+    actual_name[NAME_MAX_LEN - 1] = '\0'; // Ensure null termination
+
+    char *file_name = strrchr(path_copy, '/');
+    if (file_name == NULL) {
+        free(path_copy);
+        *errnoptr = EINVAL; // Invalid path
+        return -1;
+    }
+    *file_name = '\0'; // Split path into parent and file
+    file_name++;
+
+    struct myfs_node *parent_dir = find_node(fsptr, path_copy);
+    free(path_copy);
+
+    if (parent_dir == NULL || parent_dir->is_file) {
+        *errnoptr = parent_dir == NULL ? ENOENT : ENOTDIR;
+        return -1;
+    }
+
+    // Step 3: Check available space
+    // struct myfs_super *super = (struct myfs_super *)fsptr;
+    size_t required_space = sizeof(struct myfs_node) +
+                            (parent_dir->data.directory.number_children + 1) * sizeof(myfs_off_t);
+
+    if (super_copy->free_memory + required_space > super_copy->size) {
+        *errnoptr = ENOSPC;
+        return -1;
+    }
+
+    // Step 4: Allocate and initialize new file node
+    struct myfs_node *new_node = off_to_ptr(fsptr, super_copy->free_memory);
+    super_copy->free_memory += sizeof(struct myfs_node);
+
+    memset(new_node, 0, sizeof(struct myfs_node));
+    strncpy(new_node->name, actual_name, NAME_MAX_LEN);
+    new_node->is_file = 1;
+    clock_gettime(CLOCK_REALTIME, &new_node->times[0]);
+    new_node->times[1] = new_node->times[0];
+
+    // Step 5: Update parent directory children list
+    size_t child_array_size = (parent_dir->data.directory.number_children + 1) * sizeof(myfs_off_t);
+
+    // Allocate new block for children
+    myfs_off_t new_children_offset = super_copy->free_memory;
+    myfs_off_t *new_children = off_to_ptr(fsptr, new_children_offset);
+
+    if (parent_dir->data.directory.number_children > 0) {
+        // Copy existing children data to the new block
+        myfs_off_t *old_children = off_to_ptr(fsptr, parent_dir->data.directory.children);
+        memcpy(new_children, old_children, parent_dir->data.directory.number_children * sizeof(myfs_off_t));
+    }
+
+    // Update the children list with the new child
+    new_children[parent_dir->data.directory.number_children] = ptr_to_off(fsptr, new_node);
+    parent_dir->data.directory.children = new_children_offset;
+    parent_dir->data.directory.number_children++;
+    super_copy->free_memory += child_array_size;
+
+    return 0;
 }
+
+
 
 
 /* Implements an emulation of the unlink system call for regular files
@@ -383,11 +591,76 @@ int __myfs_mknod_implem(void *fsptr, size_t fssize, int *errnoptr, const char *p
    The error codes are documented in man 2 unlink.
 
 */
-int __myfs_unlink_implem(void *fsptr, size_t fssize, int *errnoptr,
-                        const char *path) {
-  /* STUB */
-  return -1;
+int __myfs_unlink_implem(void *fsptr, size_t fssize, int *errnoptr, const char *path) {
+    struct myfs_super *super = (struct myfs_super *)fsptr;
+    
+    // Find the parent directory and the file name
+    char *file_name;
+    struct myfs_node *parent_node = find_parent_node(fsptr, path, &file_name);
+    
+    if (parent_node == NULL) {
+        *errnoptr = ENOENT;
+        free(file_name);
+        return -1;
+    }
+    
+    if (parent_node->is_file) {
+        *errnoptr = ENOTDIR;
+        free(file_name);
+        return -1;
+    }
+    
+    // Find the file node
+    struct myfs_node *file_node = get_node(fsptr, &parent_node->data.directory, file_name);
+    
+    if (file_node == NULL) {
+        *errnoptr = ENOENT;
+        free(file_name);
+        return -1;
+    }
+    
+    if (!file_node->is_file) {
+        *errnoptr = EISDIR;
+        free(file_name);
+        return -1;
+    }
+    
+    // Remove the file from the parent directory
+    myfs_off_t *children = off_to_ptr(fsptr, parent_node->data.directory.children);
+    size_t num_children = parent_node->data.directory.number_children;
+    
+    for (size_t i = 0; i < num_children; i++) {
+        if (children[i] == ptr_to_off(fsptr, file_node)) {
+            // Move the last child to this position and decrease the count
+            children[i] = children[num_children - 1];
+            parent_node->data.directory.number_children--;
+            break;
+        }
+    }
+    
+    // Free the file's data blocks
+    struct myfs_file *file = &file_node->data.file;
+    myfs_off_t current_block = file->data;
+    while (current_block != 0) {
+        myfs_off_t *next_block = off_to_ptr(fsptr, current_block);
+        current_block = *next_block;
+        // Mark the block as free (you might want to implement a proper free list)
+        *next_block = super->free_memory;
+        super->free_memory = ptr_to_off(fsptr, next_block);
+    }
+    
+    // Mark the file node as free
+    memset(file_node, 0, sizeof(struct myfs_node));
+    *(myfs_off_t *)file_node = super->free_memory;
+    super->free_memory = ptr_to_off(fsptr, file_node);
+    
+    // Update parent directory's modification time
+    update_time(parent_node, 1);
+    
+    free(file_name);
+    return 0;
 }
+
 
 /* Implements an emulation of the rmdir system call on the filesystem 
    of size fssize pointed to by fsptr. 
