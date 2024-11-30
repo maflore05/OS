@@ -170,7 +170,7 @@ struct myfs_dir {
 
 struct myfs_node {
     char name[NAME_MAX_LEN + 1];
-    char is_file;
+    char is_file; // 0 is directory, 1 is file
     struct timespec times[2];
     union {
         struct myfs_file file;
@@ -492,8 +492,7 @@ int __myfs_mknod_implem(void *fsptr, size_t fssize, int *errnoptr, const char *p
 
     struct myfs_node *existing_node = get_node(fsptr, &parent_node->data.directory, last_token);
     if (existing_node != NULL) {
-        clock_gettime(CLOCK_REALTIME, &existing_node->times[0]);
-        existing_node->times[1] = existing_node->times[0];
+        update_time(existing_node, 1);
         *errnoptr = EEXIST;
         free(last_token);
         return -1;
@@ -505,7 +504,7 @@ int __myfs_mknod_implem(void *fsptr, size_t fssize, int *errnoptr, const char *p
         return -1;
     }
 
-    // Step 1: Validate path
+    // Validate path
     if (strcmp(path, "/") == 0) {
         *errnoptr = EINVAL; // Cannot create a file named "/"
         return -1;
@@ -517,13 +516,14 @@ int __myfs_mknod_implem(void *fsptr, size_t fssize, int *errnoptr, const char *p
         return -1;
     }
 
-    // Step 2: Find parent directory
+    // Find parent directory
     char *path_copy = strdup(path);
     if (path_copy == NULL) {
         *errnoptr = ENOMEM;
         return -1;
     }
 
+    // Get name 
     char *save_name = strrchr(path_copy, '/');
     save_name++; // Move to the name
     char actual_name[NAME_MAX_LEN];
@@ -547,8 +547,7 @@ int __myfs_mknod_implem(void *fsptr, size_t fssize, int *errnoptr, const char *p
         return -1;
     }
 
-    // Step 3: Check available space
-    // struct myfs_super *super = (struct myfs_super *)fsptr;
+    // Check available space
     size_t required_space = sizeof(struct myfs_node) +
                             (parent_dir->data.directory.number_children + 1) * sizeof(myfs_off_t);
 
@@ -557,7 +556,7 @@ int __myfs_mknod_implem(void *fsptr, size_t fssize, int *errnoptr, const char *p
         return -1;
     }
 
-    // Step 4: Allocate and initialize new file node
+    // Allocate and initialize new file node
     struct myfs_node *new_node = off_to_ptr(fsptr, super->free_memory);
     super->free_memory += sizeof(struct myfs_node);
 
@@ -567,7 +566,7 @@ int __myfs_mknod_implem(void *fsptr, size_t fssize, int *errnoptr, const char *p
     clock_gettime(CLOCK_REALTIME, &new_node->times[0]);
     new_node->times[1] = new_node->times[0];
 
-    // Step 5: Update parent directory children list
+    // Update parent directory children list
     size_t child_array_size = (parent_dir->data.directory.number_children + 1) * sizeof(myfs_off_t);
 
     // Allocate new block for children
@@ -657,7 +656,7 @@ int __myfs_unlink_implem(void *fsptr, size_t fssize, int *errnoptr, const char *
     while (current_block != 0) {
         myfs_off_t *next_block = off_to_ptr(fsptr, current_block);
         current_block = *next_block;
-        // Mark the block as free (you might want to implement a proper free list)
+        // Mark the block as free
         *next_block = super->free_memory;
         super->free_memory = ptr_to_off(fsptr, next_block);
     }
@@ -690,11 +689,69 @@ int __myfs_unlink_implem(void *fsptr, size_t fssize, int *errnoptr, const char *
    The error codes are documented in man 2 rmdir.
 
 */
-int __myfs_rmdir_implem(void *fsptr, size_t fssize, int *errnoptr,
-                        const char *path) {
-  /* STUB */
-  return -1;
+int __myfs_rmdir_implem(void *fsptr, size_t fssize, int *errnoptr, const char *path) {
+    
+    // Find the parent directory and the directory to be removed
+    char *dir_name;
+    struct myfs_node *parent_node = find_parent_node(fsptr, path, &dir_name);
+    
+    if (parent_node == NULL) {
+        *errnoptr = ENOENT;
+        free(dir_name);
+        return -1;
+    }
+    
+    if (parent_node->is_file) {
+        *errnoptr = ENOTDIR;
+        free(dir_name);
+        return -1;
+    }
+    
+    // Find the directory node to be removed
+    struct myfs_node *dir_node = get_node(fsptr, &parent_node->data.directory, dir_name);
+    
+    if (dir_node == NULL) {
+        *errnoptr = ENOENT;
+        free(dir_name);
+        return -1;
+    }
+    
+    if (dir_node->is_file) {
+        *errnoptr = ENOTDIR;
+        free(dir_name);
+        return -1;
+    }
+    
+    // Check if the directory is empty
+    if (dir_node->data.directory.number_children > 0) {
+        *errnoptr = ENOTEMPTY;
+        free(dir_name);
+        return -1;
+    }
+    
+    // Remove the directory from the parent's children list
+    myfs_off_t *parent_children = off_to_ptr(fsptr, parent_node->data.directory.children);
+    size_t num_children = parent_node->data.directory.number_children;
+    
+    for (size_t i = 0; i < num_children; i++) {
+        if (parent_children[i] == ptr_to_off(fsptr, dir_node)) {
+            // Move the last child to this position and decrease the count
+            parent_children[i] = parent_children[num_children - 1];
+            parent_node->data.directory.number_children--;
+            break;
+        }
+    }
+    
+    // Free the directory node
+    memset(dir_node, 0, sizeof(struct myfs_node));
+    
+    // Update parent directory's modification time
+    update_time(parent_node, 1);
+    
+    free(dir_name);
+    return 0;
 }
+
 
 /* Implements an emulation of the mkdir system call on the filesystem 
    of size fssize pointed to by fsptr. 
