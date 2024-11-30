@@ -146,12 +146,11 @@
 /* Helper types and functions */
 
 #define NAME_MAX_LEN 255
-#define BLOCK_SIZE 1024
 
 typedef size_t myfs_off_t;
 
 struct myfs_super {
-    uint32_t magic;
+    uint32_t is_set;
     myfs_off_t root_dir;
     myfs_off_t free_memory;
     size_t size;
@@ -206,8 +205,8 @@ struct myfs_super *initialize_myfs(void *fsptr, size_t fssize) {
     struct myfs_super *super = (struct myfs_super *)fsptr;
 
     // Check if the filesystem is already initialized
-    if (super->magic != 0xCAFEBABE) {
-        super->magic = 0xCAFEBABE;
+    if (super->is_set != 1) {
+        super->is_set = 1;
         super->size = fssize;
         super->root_dir = sizeof(struct myfs_super);
 
