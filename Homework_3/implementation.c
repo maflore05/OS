@@ -202,6 +202,37 @@ static myfs_off_t ptr_to_off(void *fsptr, void *ptr) {
     return (myfs_off_t)((char *)ptr - (char *)fsptr);
 }
 
+struct myfs_super *initialize_myfs(void *fsptr, size_t fssize) {
+    struct myfs_super *super = (struct myfs_super *)fsptr;
+
+    // Check if the filesystem is already initialized
+    if (super->magic != 0xCAFEBABE) {
+        super->magic = 0xCAFEBABE;
+        super->size = fssize;
+        super->root_dir = sizeof(struct myfs_super);
+
+        // Initialize the root directory node
+        struct myfs_node *root = off_to_ptr(fsptr, super->root_dir);
+        memset(root->name, '\0', NAME_MAX_LEN + 1);
+        strcpy(root->name, "/");
+        update_time(root, 1);  // Mark the root directory creation time
+        root->is_file = 0;    // Mark as a directory
+
+        // Initialize root directory's children
+        root->data.directory.number_children = 0;
+        myfs_off_t *children = off_to_ptr(fsptr, super->root_dir + sizeof(struct myfs_node));
+        *children = 0;
+        root->data.directory.children = ptr_to_off(fsptr, children);
+
+        // Set up free memory pointer
+        super->free_memory = ptr_to_off(fsptr, children + 1);
+        myfs_off_t *free_memory = off_to_ptr(fsptr, super->free_memory);
+        *free_memory = fssize - super->free_memory - sizeof(size_t);
+    }
+
+    return super;
+}
+
 static struct myfs_node *find_node(void *fsptr, const char *path) {
     struct myfs_super *super = (struct myfs_super *)fsptr;
     struct myfs_node *current = off_to_ptr(fsptr, super->root_dir);
@@ -343,7 +374,6 @@ int __myfs_getattr_implem(void *fsptr, size_t fssize, int *errnoptr,
     stbuf->st_gid = gid;
     stbuf->st_atime = node->times[0].tv_sec;
     stbuf->st_mtime = node->times[1].tv_sec;
-    stbuf->st_ctime = node->times[1].tv_sec;
 
     if (node->is_file) {
         stbuf->st_mode = S_IFREG | 0644;
@@ -444,30 +474,7 @@ int __myfs_readdir_implem(void *fsptr, size_t fssize, int *errnoptr,
 
 */
 int __myfs_mknod_implem(void *fsptr, size_t fssize, int *errnoptr, const char *path) {
-    struct myfs_super *super = (struct myfs_super *)fsptr;
-    struct myfs_super *super_copy = (struct myfs_super *)fsptr;
-
-    // Initialize the file system if not already initialized
-    if (super->magic != 0xCAFEBABE) {
-        super->magic = 0xCAFEBABE;
-        super->size = fssize;
-        super->root_dir = sizeof(struct myfs_super);
-
-        struct myfs_node *root = off_to_ptr(fsptr, super->root_dir);
-        memset(root->name, '\0', NAME_MAX_LEN + 1);
-        strcpy(root->name, "/");
-        update_time(root, 1);
-        root->is_file = 0;
-
-        root->data.directory.number_children = 0;
-        myfs_off_t *children = off_to_ptr(fsptr, super->root_dir + sizeof(struct myfs_node));
-        *children = 0;
-        root->data.directory.children = ptr_to_off(fsptr, children);
-
-        super->free_memory = ptr_to_off(fsptr, children + 1);
-        myfs_off_t *free_memory = off_to_ptr(fsptr, super->free_memory);
-        *free_memory = fssize - super->free_memory - sizeof(size_t);
-    }
+    struct myfs_super *super = initialize_myfs(fsptr, fssize);
 
     struct myfs_node *parent_node;
     char *last_token;
@@ -486,6 +493,8 @@ int __myfs_mknod_implem(void *fsptr, size_t fssize, int *errnoptr, const char *p
 
     struct myfs_node *existing_node = get_node(fsptr, &parent_node->data.directory, last_token);
     if (existing_node != NULL) {
+        clock_gettime(CLOCK_REALTIME, &existing_node->times[0]);
+        existing_node->times[1] = existing_node->times[0];
         *errnoptr = EEXIST;
         free(last_token);
         return -1;
@@ -544,14 +553,14 @@ int __myfs_mknod_implem(void *fsptr, size_t fssize, int *errnoptr, const char *p
     size_t required_space = sizeof(struct myfs_node) +
                             (parent_dir->data.directory.number_children + 1) * sizeof(myfs_off_t);
 
-    if (super_copy->free_memory + required_space > super_copy->size) {
+    if (super->free_memory + required_space > super->size) {
         *errnoptr = ENOSPC;
         return -1;
     }
-    
+
     // Step 4: Allocate and initialize new file node
-    struct myfs_node *new_node = off_to_ptr(fsptr, super_copy->free_memory);
-    super_copy->free_memory += sizeof(struct myfs_node);
+    struct myfs_node *new_node = off_to_ptr(fsptr, super->free_memory);
+    super->free_memory += sizeof(struct myfs_node);
 
     memset(new_node, 0, sizeof(struct myfs_node));
     strncpy(new_node->name, actual_name, NAME_MAX_LEN);
@@ -563,7 +572,7 @@ int __myfs_mknod_implem(void *fsptr, size_t fssize, int *errnoptr, const char *p
     size_t child_array_size = (parent_dir->data.directory.number_children + 1) * sizeof(myfs_off_t);
 
     // Allocate new block for children
-    myfs_off_t new_children_offset = super_copy->free_memory;
+    myfs_off_t new_children_offset = super->free_memory;
     myfs_off_t *new_children = off_to_ptr(fsptr, new_children_offset);
 
     if (parent_dir->data.directory.number_children > 0) {
@@ -576,7 +585,7 @@ int __myfs_mknod_implem(void *fsptr, size_t fssize, int *errnoptr, const char *p
     new_children[parent_dir->data.directory.number_children] = ptr_to_off(fsptr, new_node);
     parent_dir->data.directory.children = new_children_offset;
     parent_dir->data.directory.number_children++;
-    super_copy->free_memory += child_array_size;
+    super->free_memory += child_array_size;
 
     return 0;
 }
@@ -701,29 +710,7 @@ int __myfs_rmdir_implem(void *fsptr, size_t fssize, int *errnoptr,
 
 */
 int __myfs_mkdir_implem(void *fsptr, size_t fssize, int *errnoptr, const char *path) {
-    struct myfs_super *super = (struct myfs_super *)fsptr;
-
-    // Initialize the file system if not already initialized
-    if (super->magic != 0xCAFEBABE) {
-        super->magic = 0xCAFEBABE;
-        super->size = fssize;
-        super->root_dir = sizeof(struct myfs_super);
-
-        struct myfs_node *root = off_to_ptr(fsptr, super->root_dir);
-        memset(root->name, '\0', NAME_MAX_LEN + 1);
-        strcpy(root->name, "/");
-        update_time(root, 1);
-        root->is_file = 0;
-
-        root->data.directory.number_children = 0;
-        myfs_off_t *children = off_to_ptr(fsptr, super->root_dir + sizeof(struct myfs_node));
-        *children = 0;
-        root->data.directory.children = ptr_to_off(fsptr, children);
-
-        super->free_memory = ptr_to_off(fsptr, children + 1);
-        myfs_off_t *free_memory = off_to_ptr(fsptr, super->free_memory);
-        *free_memory = fssize - super->free_memory - sizeof(size_t);
-    }
+    struct myfs_super *super = initialize_myfs(fsptr, fssize);
 
     // Find the parent directory and the last token (directory name)
     char *last_token;
