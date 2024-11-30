@@ -95,25 +95,6 @@
    accumulate over time. In a working setup, a FUSE process is
    supposed to run for a long time!
 
-   It is possible to check for memory leaks by running the FUSE
-   process inside valgrind:
-
-   valgrind --leak-check=full ./myfs --backupfile=test.myfs ~/fuse-mnt/ -f
-
-   However, the analysis of the leak indications displayed by valgrind
-   is difficult as libfuse contains some small memory leaks (which do
-   not accumulate over time). We cannot (easily) fix these memory
-   leaks inside libfuse.
-
-   * Avoid putting debug messages into the code. You may use fprintf
-   for debugging purposes but they should all go away in the final
-   version of the code. Using gdb is more professional, though.
-
-   * You MUST NOT fail with exit(1) in case of an error. All the
-   functions you have to implement have ways to indicated failure
-   cases. Use these, mapping your internal errors intelligently onto
-   the POSIX error conditions.
-
    * And of course: your code MUST NOT SEGFAULT!
 
    It is reasonable to proceed in the following order:
@@ -160,78 +141,6 @@
          and check that they start to exist (with the appropriate
          access/modification times) with ls -la.
 
-   (7)   Design and implement __myfs_mkdir_implem. Test as above.
-
-   (8)   Design and implement __myfs_truncate_implem. You can now 
-         create files filled with zeros:
-
-         truncate -s 1024 foo
-
-   (9)   Design and implement __myfs_statfs_implem. Test by running
-         df before and after the truncation of a file to various lengths. 
-         The free "disk" space must change accordingly.
-
-   (10)  Design, implement and test __myfs_utimens_implem. You can now 
-         touch files at different dates (in the past, in the future).
-
-   (11)  Design and implement __myfs_open_implem. The function can 
-         only be tested once __myfs_read_implem and __myfs_write_implem are
-         implemented.
-
-   (12)  Design, implement and test __myfs_read_implem and
-         __myfs_write_implem. You can now write to files and read the data 
-         back:
-
-         echo "Hello world" > foo
-         echo "Hallo ihr da" >> foo
-         cat foo
-
-         Be sure to test the case when you unmount and remount the
-         filesystem: the files must still be there, contain the same
-         information and have the same access and/or modification
-         times.
-
-   (13)  Design, implement and test __myfs_unlink_implem. You can now
-         remove files.
-
-   (14)  Design, implement and test __myfs_unlink_implem. You can now
-         remove directories.
-
-   (15)  Design, implement and test __myfs_rename_implem. This function
-         is extremely complicated to implement. Be sure to cover all 
-         cases that are documented in man 2 rename. The case when the 
-         new path exists already is really hard to implement. Be sure to 
-         never leave the filessystem in a bad state! Test thoroughly 
-         using mv on (filled and empty) directories and files onto 
-         inexistant and already existing directories and files.
-
-   (16)  Design, implement and test any function that your instructor
-         might have left out from this list. There are 13 functions 
-         __myfs_XXX_implem you have to write.
-
-   (17)  Go over all functions again, testing them one-by-one, trying
-         to exercise all special conditions (error conditions): set
-         breakpoints in gdb and use a sequence of bash commands inside
-         your mounted filesystem to trigger these special cases. Be
-         sure to cover all funny cases that arise when the filesystem
-         is full but files are supposed to get written to or truncated
-         to longer length. There must not be any segfault; the user
-         space program using your filesystem just has to report an
-         error. Also be sure to unmount and remount your filesystem,
-         in order to be sure that it contents do not change by
-         unmounting and remounting. Try to mount two of your
-         filesystems at different places and copy and move (rename!)
-         (heavy) files (your favorite movie or song, an image of a cat
-         etc.) from one mount-point to the other. None of the two FUSE
-         processes must provoke errors. Find ways to test the case
-         when files have holes as the process that wrote them seeked
-         beyond the end of the file several times. Your filesystem must
-         support these operations at least by making the holes explicit 
-         zeros (use dd to test this aspect).
-
-   (18)  Run some heavy testing: copy your favorite movie into your
-         filesystem and try to watch it out of the filesystem.
-
 */
 
 /* Helper types and functions */
@@ -269,6 +178,21 @@ struct myfs_node {
         struct myfs_dir directory;
     } data;
 };
+
+static void update_time(struct myfs_node *node, int set_mod) {
+    if (node == NULL) {
+        return;
+    }
+
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_REALTIME, &ts) == 0) {
+        node->times[0] = ts;
+        if (set_mod) {
+            node->times[1] = ts;
+        }
+    }
+}
 
 static void *off_to_ptr(void *fsptr, myfs_off_t offset) {
     return (char *)fsptr + offset;
@@ -314,24 +238,6 @@ static struct myfs_node *find_node(void *fsptr, const char *path) {
     return current;
 }
 
-// A combination of previous file
-
-static void update_time(struct myfs_node *node, int set_mod) {
-    if (node == NULL) {
-        return;
-    }
-
-    struct timespec ts;
-
-    if (clock_gettime(CLOCK_REALTIME, &ts) == 0) {
-        node->times[0] = ts;
-        if (set_mod) {
-            node->times[1] = ts;
-        }
-    }
-}
-
-
 static struct myfs_node *find_parent_node(void *fsptr, const char *path, char **last_token) {
     struct myfs_super *super = (struct myfs_super *)fsptr;
     struct myfs_node *current = off_to_ptr(fsptr, super->root_dir);
@@ -341,15 +247,21 @@ static struct myfs_node *find_parent_node(void *fsptr, const char *path, char **
         return current;
     }
 
+    // Normalize path
     char *path_copy = strdup(path);
+    if (!path_copy) return NULL;
+    while (path_copy[strlen(path_copy) - 1] == '/')
+        path_copy[strlen(path_copy) - 1] = '\0'; // Remove trailing slashes
+
     char *token = strtok(path_copy, "/");
     char *prev_token = NULL;
 
     while (token != NULL) {
         prev_token = token;
-        token = strtok(NULL, "/");
+        char *next_token = strtok(NULL, "/");
 
-        if (token == NULL) {
+        if (!next_token) {
+            // Stop before the last token to find the parent
             break;
         }
 
@@ -367,8 +279,10 @@ static struct myfs_node *find_parent_node(void *fsptr, const char *path, char **
 
         if (!found) {
             free(path_copy);
-            return NULL;
+            return NULL; // Child not found
         }
+
+        token = next_token;
     }
 
     *last_token = strdup(prev_token);
@@ -634,7 +548,7 @@ int __myfs_mknod_implem(void *fsptr, size_t fssize, int *errnoptr, const char *p
         *errnoptr = ENOSPC;
         return -1;
     }
-
+    
     // Step 4: Allocate and initialize new file node
     struct myfs_node *new_node = off_to_ptr(fsptr, super_copy->free_memory);
     super_copy->free_memory += sizeof(struct myfs_node);
@@ -786,11 +700,120 @@ int __myfs_rmdir_implem(void *fsptr, size_t fssize, int *errnoptr,
    The error codes are documented in man 2 mkdir.
 
 */
-int __myfs_mkdir_implem(void *fsptr, size_t fssize, int *errnoptr,
-                        const char *path) {
-  /* STUB */
-  return -1;
+int __myfs_mkdir_implem(void *fsptr, size_t fssize, int *errnoptr, const char *path) {
+    struct myfs_super *super = (struct myfs_super *)fsptr;
+
+    // Initialize the file system if not already initialized
+    if (super->magic != 0xCAFEBABE) {
+        super->magic = 0xCAFEBABE;
+        super->size = fssize;
+        super->root_dir = sizeof(struct myfs_super);
+
+        struct myfs_node *root = off_to_ptr(fsptr, super->root_dir);
+        memset(root->name, '\0', NAME_MAX_LEN + 1);
+        strcpy(root->name, "/");
+        update_time(root, 1);
+        root->is_file = 0;
+
+        root->data.directory.number_children = 0;
+        myfs_off_t *children = off_to_ptr(fsptr, super->root_dir + sizeof(struct myfs_node));
+        *children = 0;
+        root->data.directory.children = ptr_to_off(fsptr, children);
+
+        super->free_memory = ptr_to_off(fsptr, children + 1);
+        myfs_off_t *free_memory = off_to_ptr(fsptr, super->free_memory);
+        *free_memory = fssize - super->free_memory - sizeof(size_t);
+    }
+
+    // Find the parent directory and the last token (directory name)
+    char *last_token;
+    struct myfs_node *parent_node = find_parent_node(fsptr, path, &last_token);
+    if (parent_node == NULL) {
+        *errnoptr = ENOENT;
+        free(last_token);
+        return -1;
+    }
+
+    if (parent_node->is_file) {
+        *errnoptr = ENOTDIR;
+        free(last_token);
+        return -1;
+    }
+
+    // Check if the directory name already exists
+    struct myfs_node *existing_node = get_node(fsptr, &parent_node->data.directory, last_token);
+    if (existing_node != NULL) {
+        *errnoptr = EEXIST;
+        free(last_token);
+        return -1;
+    }
+
+    // Check if the directory name is too long
+    if (strlen(last_token) > NAME_MAX_LEN) {
+        *errnoptr = ENAMETOOLONG;
+        free(last_token);
+        return -1;
+    }
+
+    // Check if the path is the root directory
+    if (strcmp(path, "/") == 0) {
+        *errnoptr = EEXIST; // Cannot create a directory named "/"
+        free(last_token);
+        return -1;
+    }
+
+    // Calculate the required space for the new directory node and its children list
+    size_t required_space = sizeof(struct myfs_node) + sizeof(myfs_off_t);
+
+    if (super->free_memory + required_space > super->size) {
+        *errnoptr = ENOSPC;
+        free(last_token);
+        return -1;
+    }
+
+    // Allocate and initialize the new directory node
+    struct myfs_node *new_dir = off_to_ptr(fsptr, super->free_memory);
+    super->free_memory += sizeof(struct myfs_node);
+
+    memset(new_dir, 0, sizeof(struct myfs_node));
+    strncpy(new_dir->name, last_token, NAME_MAX_LEN);
+    new_dir->is_file = 0;
+    update_time(new_dir, 1);
+
+    // Initialize the new directory's children list
+    myfs_off_t *children = off_to_ptr(fsptr, super->free_memory);
+    *children = 0;
+    new_dir->data.directory.children = ptr_to_off(fsptr, children);
+    new_dir->data.directory.number_children = 0;
+    super->free_memory += sizeof(myfs_off_t);
+
+    // Update the parent directory's children list
+    size_t child_array_size = (parent_node->data.directory.number_children + 1) * sizeof(myfs_off_t);
+
+    // Allocate new block for children
+    myfs_off_t new_children_offset = super->free_memory;
+    myfs_off_t *new_children = off_to_ptr(fsptr, new_children_offset);
+
+    if (parent_node->data.directory.number_children > 0) {
+        // Copy existing children data to the new block
+        myfs_off_t *old_children = off_to_ptr(fsptr, parent_node->data.directory.children);
+        memcpy(new_children, old_children, parent_node->data.directory.number_children * sizeof(myfs_off_t));
+    }
+
+    // Update the children list with the new child
+    new_children[parent_node->data.directory.number_children] = ptr_to_off(fsptr, new_dir);
+    parent_node->data.directory.children = new_children_offset;
+    parent_node->data.directory.number_children++;
+    super->free_memory += child_array_size;
+
+    // Update the parent directory's modification time
+    update_time(parent_node, 1);
+
+    free(last_token);
+    return 0;
 }
+
+
 
 /* Implements an emulation of the rename system call on the filesystem 
    of size fssize pointed to by fsptr. 
