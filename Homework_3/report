@@ -1,0 +1,58 @@
+Rename Function:
+
+    Design Decisions:
+        Ensures that only valid source and destination files are processed to avoid accidental overwrites or renaming of non-empty directories.
+        Checks for symbolic and hard links, though symbolic links are fully handled while hard links require further refinement.
+    Problems Encountered:
+        Initial handling of hard links was not fully implemented, leading to potential issues when they were involved.
+        Needed further consideration for symbolic and hard links beyond just basic file renaming.
+
+Truncate Function:
+
+    Design Decisions:
+        Allows truncation only on regular files, ensuring that directories are not truncated inadvertently.
+        Proper memory management is ensured when truncating files by freeing excess memory when reducing file size.
+    Problems Encountered:
+        Encountered issues when expanding files, as the system could run out of memory, causing crashes.
+        Implemented error checks to handle memory allocation failures during file expansion.
+
+Open Function:
+
+    Design Decisions:
+        Differentiates between files and directories, ensuring only files are opened in regular file modes, while directories are handled for navigation and reading.
+        Prevents errors by treating directories separately from files.
+    Problems Encountered:
+        The challenge was managing the interaction between files and directories properly to avoid errors when directories were incorrectly treated as files.
+
+Read Function:
+
+    Design Decisions:
+        Checks if the file offset is within bounds, returning zero bytes if the offset exceeds the file’s size, preventing invalid reads.
+        Ensures graceful handling of out-of-bounds read requests.
+    Problems Encountered:
+        Needed to validate file descriptors properly and manage out-of-bounds read attempts to ensure that zero bytes are returned when necessary.
+        Ensuring the correct boundary conditions for file reading was crucial to avoid reading past the end of the file.
+
+Write Function:
+
+    Design Decisions:
+        Allocates memory dynamically as the file grows, ensuring memory usage is optimized.
+        Updates metadata (like modification time) when data is written to maintain accurate file system information.
+    Problems Encountered:
+        Memory fragmentation during large writes was a concern, and managing file size updates consistently was a challenge.
+        Ensuring that memory was properly allocated and managed as the file grew was crucial to prevent memory issues.
+
+Utimens Function:
+
+    Design Decisions:
+        Updates file access and modification times, defaulting to the current time if no timestamps are provided, following typical system behavior.
+    Problems Encountered:
+        Handling cases where access or modification times were not provided required proper management to avoid unintended timestamp changes.
+
+Statfs Function:
+
+    Design Decisions:
+        Collects accurate file system statistics, including total space and free space, to reflect the actual file system usage.
+        Ensures the statistics returned are in line with expectations from a real file system.
+    Problems Encountered:
+        Ensuring that the file system statistics were accurately calculated, particularly the total and free space values, required careful design to avoid discrepancies with actual values.
