@@ -156,7 +156,28 @@ struct myfs_super {
     size_t size;
 };
 
-struct myfs_file {
+/* Superblock structure */
+typedef struct myfs_superblock {
+    size_t total_blocks;
+    size_t free_blocks;
+    size_t block_size;
+    size_t namemax;
+} myfs_superblock_t;
+
+/* Combined myfs_file_t structure */
+typedef struct myfs_file {
+    char name[NAME_MAX_LEN];         // Name of the file or directory
+    int is_directory;                // 1 if it's a directory, 0 if it's a file
+    size_t size;                     // Size of the file (in bytes)
+    char *data;                      // Pointer to file data (for files)
+    size_t children_offset;          // Offset to child files or directories
+    size_t next_offset;              // Offset to next sibling file or directory
+    time_t mtime;                    // Last modification time
+    time_t ctime;                    // Creation time
+    time_t atime;                    // Last access time
+} myfs_file_t;
+
+struct myfs_file_data {
     size_t size;
     size_t allocated;
     myfs_off_t data;
@@ -173,7 +194,7 @@ struct myfs_node {
     char is_file; // 0 is directory, 1 is file
     struct timespec times[2];
     union {
-        struct myfs_file file;
+        struct myfs_file_data file;
         struct myfs_dir directory;
     } data;
 };
@@ -329,6 +350,45 @@ static struct myfs_node *get_node(void *fsptr, struct myfs_dir *dir, const char 
         }
     }
     return NULL;
+}
+
+size_t myfs_traverse_path(void *fsptr, const char *path) {
+    char *token, *path_copy;
+    size_t current_offset = 0;
+
+    if (path[0] == '/') {
+        current_offset = 0;
+    }
+
+    path_copy = strdup(path);
+    token = strtok(path_copy, "/");
+
+    while (token != NULL) {
+        myfs_file_t *current = (myfs_file_t *)((char *)fsptr + current_offset);
+        size_t next_offset = current->children_offset;
+        myfs_file_t *next = (next_offset != 0) ? (myfs_file_t *)((char *)fsptr + next_offset) : NULL;
+
+        int found = 0;
+        while (next != NULL) {
+            if (strcmp(next->name, token) == 0) {
+                current_offset = next_offset;
+                found = 1;
+                break;
+            }
+            next_offset = next->next_offset;
+            next = (next_offset != 0) ? (myfs_file_t *)((char *)fsptr + next_offset) : NULL;
+        }
+
+        if (!found) {
+            free(path_copy);
+            return (size_t)-1;
+        }
+
+        token = strtok(NULL, "/");
+    }
+
+    free(path_copy);
+    return current_offset;
 }
 
 /* End of helper functions */
@@ -566,6 +626,12 @@ int __myfs_mknod_implem(void *fsptr, size_t fssize, int *errnoptr, const char *p
     clock_gettime(CLOCK_REALTIME, &new_node->times[0]);
     new_node->times[1] = new_node->times[0];
 
+    // Initialize file data
+    new_node->data.file.size = 0;
+    new_node->data.file.allocated = 0;
+    new_node->data.file.data = 0;
+    new_node->data.file.next_file_block = 0;
+
     // Update parent directory children list
     size_t child_array_size = (parent_dir->data.directory.number_children + 1) * sizeof(myfs_off_t);
 
@@ -585,6 +651,7 @@ int __myfs_mknod_implem(void *fsptr, size_t fssize, int *errnoptr, const char *p
     parent_dir->data.directory.number_children++;
     super->free_memory += child_array_size;
 
+    free(last_token);
     return 0;
 }
 
@@ -651,7 +718,7 @@ int __myfs_unlink_implem(void *fsptr, size_t fssize, int *errnoptr, const char *
     }
     
     // Free the file's data blocks
-    struct myfs_file *file = &file_node->data.file;
+    struct myfs_file_data *file = &file_node->data.file;
     myfs_off_t current_block = file->data;
     while (current_block != 0) {
         myfs_off_t *next_block = off_to_ptr(fsptr, current_block);
@@ -876,8 +943,74 @@ int __myfs_mkdir_implem(void *fsptr, size_t fssize, int *errnoptr, const char *p
 */
 int __myfs_rename_implem(void *fsptr, size_t fssize, int *errnoptr,
                          const char *from, const char *to) {
-  /* STUB */
-  return -1;
+    if (!fsptr || !from || !to || from[0] == '\0' || to[0] == '\0') {
+        *errnoptr = EINVAL; // Invalid arguments
+        return -1;
+    }
+
+    // Ensure paths are not identical
+    if (strcmp(from, to) == 0) {
+        *errnoptr = 0; // No error, nothing to do
+        return 0;
+    }
+
+    // Locate the file or directory corresponding to `from`
+    size_t from_offset = myfs_traverse_path(fsptr, from);
+    if (from_offset == (size_t)-1) {
+        *errnoptr = ENOENT; // Source not found
+        return -1;
+    }
+
+    // Ensure `to` does not already exist
+    size_t to_offset = myfs_traverse_path(fsptr, to);
+    if (to_offset != (size_t)-1) {
+        *errnoptr = EEXIST; // Target already exists
+        return -1;
+    }
+
+    // Retrieve the source file/directory structure
+    myfs_file_t *source = (myfs_file_t *)((char *)fsptr + from_offset);
+
+    // Check if it's a non-empty directory
+    if (source->is_directory && source->children_offset != 0) {
+        *errnoptr = ENOTEMPTY; // Cannot rename non-empty directory
+        return -1;
+    }
+
+    // Update the name (using strcpy instead of assignment)
+    char *new_name = strdup(to + 1); // Extract name from the `to` path
+    if (!new_name) {
+        *errnoptr = ENOMEM; // Memory allocation failed
+        return -1;
+    }
+
+    // Free the old name memory and copy the new name into the array
+    // Note: the `name` field is a fixed-size array, so it will be overwritten
+    strcpy(source->name, new_name); // Copy new name into the name array
+
+    // Free the dynamically allocated memory for the new name
+    free(new_name);
+
+    // Re-link the child in the parent directory's linked list (if needed)
+    size_t parent_offset = source->children_offset; // This will need to be determined based on your directory structure
+    if (parent_offset != 0) {
+        myfs_file_t *parent = (myfs_file_t *)((char *)fsptr + parent_offset);
+        
+        size_t next_offset = parent->children_offset;
+        myfs_file_t *child = (next_offset != 0) ? (myfs_file_t *)((char *)fsptr + next_offset) : NULL;
+
+        // Find and update the correct parent-child link in the linked list
+        while (child != NULL) {
+            if (child == source) {
+                break;
+            }
+            next_offset = child->next_offset;
+            child = (next_offset != 0) ? (myfs_file_t *)((char *)fsptr + next_offset) : NULL;
+        }
+    }
+
+    *errnoptr = 0; // Success
+    return 0;
 }
 
 /* Implements an emulation of the truncate system call on the filesystem 
@@ -898,8 +1031,54 @@ int __myfs_rename_implem(void *fsptr, size_t fssize, int *errnoptr,
 */
 int __myfs_truncate_implem(void *fsptr, size_t fssize, int *errnoptr,
                            const char *path, off_t offset) {
-  /* STUB */
-  return -1;
+    if (offset < 0) {
+        *errnoptr = EINVAL;
+        return -1;
+    }
+
+    size_t file_offset = myfs_traverse_path(fsptr, path);
+    if (file_offset == (size_t)-1) {
+        *errnoptr = ENOENT;
+        return -1;
+    }
+
+    myfs_file_t *file = (myfs_file_t *)((char *)fsptr + file_offset);
+
+    if (file->is_directory) {
+        *errnoptr = EISDIR;
+        return -1;
+    }
+
+    size_t current_size = file->size;
+
+    if ((uintptr_t)fsptr + fssize < (uintptr_t)fsptr + file_offset + offset) {
+        *errnoptr = ENOSPC;
+        return -1;
+    }
+
+    if (offset > current_size) {
+        char *new_data = realloc(file->data, offset);
+        if (!new_data) {
+            *errnoptr = ENOMEM;
+            return -1;
+        }
+
+        memset(new_data + current_size, 0, offset - current_size);
+        file->data = new_data;
+    } else if (offset < current_size) {
+        char *new_data = realloc(file->data, offset);
+        if (!new_data && offset > 0) {
+            *errnoptr = ENOMEM;
+            return -1;
+        }
+        file->data = new_data;
+    }
+
+    file->size = offset;
+    file->mtime = time(NULL);
+
+    *errnoptr = 0;
+    return 0;
 }
 
 /* Implements an emulation of the open system call on the filesystem 
@@ -928,10 +1107,30 @@ int __myfs_truncate_implem(void *fsptr, size_t fssize, int *errnoptr,
    The error codes are documented in man 2 open.
 
 */
-int __myfs_open_implem(void *fsptr, size_t fssize, int *errnoptr,
-                       const char *path) {
-  /* STUB */
-  return -1;
+int __myfs_open_implem(void *fsptr, size_t fssize, int *errnoptr, const char *path) {
+    if (!fsptr || fssize <= 0) {
+        if (errnoptr) *errnoptr = EFAULT;
+        return -1;
+    }
+
+    size_t file_offset = myfs_traverse_path(fsptr, path);
+    if (file_offset == (size_t)-1) {
+        if (errnoptr) *errnoptr = ENOENT;
+        return -1;
+    }
+
+    myfs_file_t *file = (myfs_file_t *)((char *)fsptr + file_offset);
+
+    if (strcmp(path, "/") == 0 && file->is_directory) {
+        return 0;
+    }
+
+    if (file->is_directory) {
+        if (errnoptr) *errnoptr = EISDIR;
+        return -1;
+    }
+
+    return 0;
 }
 
 /* Implements an emulation of the read system call on the filesystem 
@@ -951,8 +1150,35 @@ int __myfs_open_implem(void *fsptr, size_t fssize, int *errnoptr,
 */
 int __myfs_read_implem(void *fsptr, size_t fssize, int *errnoptr,
                        const char *path, char *buf, size_t size, off_t offset) {
-  /* STUB */
-  return -1;
+    if (!fsptr || fssize <= 0) {
+        if (errnoptr) *errnoptr = EFAULT;
+        return -1;
+    }
+
+    size_t file_offset = myfs_traverse_path(fsptr, path);
+    if (file_offset == (size_t)-1) {
+        if (errnoptr) *errnoptr = ENOENT;
+        return -1;
+    }
+
+    myfs_file_t *file = (myfs_file_t *)((char *)fsptr + file_offset);
+    if (file->is_directory) {
+        if (errnoptr) *errnoptr = EISDIR;
+        return -1;
+    }
+
+    if (offset >= file->size) {
+        if (errnoptr) *errnoptr = 0;
+        return 0;
+    }
+
+    size_t readable_size = file->size - offset;
+    if (size > readable_size) {
+        size = readable_size;
+    }
+
+    memcpy(buf, (char *)fsptr + file_offset + sizeof(myfs_file_t) + offset, size);
+    return size;
 }
 
 /* Implements an emulation of the write system call on the filesystem 
@@ -972,8 +1198,39 @@ int __myfs_read_implem(void *fsptr, size_t fssize, int *errnoptr,
 */
 int __myfs_write_implem(void *fsptr, size_t fssize, int *errnoptr,
                         const char *path, const char *buf, size_t size, off_t offset) {
-  /* STUB */
-  return -1;
+    if (!fsptr) {
+        return -1;
+    }
+
+    size_t file_offset = myfs_traverse_path(fsptr, path);
+    if (file_offset == (size_t)-1) {
+        if (errnoptr) *errnoptr = ENOENT;
+        return -1;
+    }
+
+    myfs_file_t *file = (myfs_file_t *)((char *)fsptr + file_offset);
+
+    if (file->is_directory) {
+        if (errnoptr) *errnoptr = EISDIR;
+        return -1;
+    }
+
+    // If the new data size exceeds the current file size, resize the data buffer
+    if (offset + size > file->size) {
+        file->size = offset + size;
+
+        // Reallocate the 'data' field to hold the new size of data
+        file->data = (char *)realloc(file->data, file->size);
+        if (file->data == NULL) {
+            if (errnoptr) *errnoptr = ENOMEM;
+            return -1;
+        }
+    }
+
+    // Write the data to the file at the specified offset
+    memcpy(file->data + offset, buf, size);
+    file->mtime = time(NULL); // Update the modification time
+    return size;
 }
 
 /* Implements an emulation of the utimensat system call on the filesystem 
@@ -991,8 +1248,51 @@ int __myfs_write_implem(void *fsptr, size_t fssize, int *errnoptr,
 */
 int __myfs_utimens_implem(void *fsptr, size_t fssize, int *errnoptr,
                           const char *path, const struct timespec ts[2]) {
-  /* STUB */
-  return -1;
+    if (!fsptr || fssize <= 0 || !path || !errnoptr) {
+        if (errnoptr) *errnoptr = EFAULT;
+        return -1;
+    }
+
+    if (strlen(path) == 0 || strcmp(path, "/") == 0) {
+        *errnoptr = EINVAL;
+        return -1;
+    }
+
+    size_t file_offset = myfs_traverse_path(fsptr, path);
+    if (file_offset == (size_t)-1) {
+        *errnoptr = ENOENT;
+        return -1;
+    }
+
+    myfs_file_t *file = (myfs_file_t *)((char *)fsptr + file_offset);
+
+    if (file->is_directory) {
+        *errnoptr = EISDIR;
+        return -1;
+    }
+
+    time_t now = time(NULL);
+    if (!ts) {
+        file->atime = file->mtime = now;
+    } else {
+        for (int i = 0; i < 2; i++) {
+            if (ts[i].tv_nsec != UTIME_NOW && ts[i].tv_nsec != UTIME_OMIT &&
+                (ts[i].tv_nsec < 0 || ts[i].tv_nsec >= 1000000000)) {
+                *errnoptr = EINVAL;
+                return -1;
+            }
+        }
+
+        if (ts[0].tv_nsec != UTIME_OMIT) {
+            file->atime = (ts[0].tv_nsec == UTIME_NOW) ? now : ts[0].tv_sec;
+        }
+        if (ts[1].tv_nsec != UTIME_OMIT) {
+            file->mtime = (ts[1].tv_nsec == UTIME_NOW) ? now : ts[1].tv_sec;
+        }
+    }
+
+    file->ctime = now;
+    return 0;
 }
 
 /* Implements an emulation of the statfs system call on the filesystem 
@@ -1018,9 +1318,21 @@ int __myfs_utimens_implem(void *fsptr, size_t fssize, int *errnoptr,
              filesystem has such a maximum
 
 */
-int __myfs_statfs_implem(void *fsptr, size_t fssize, int *errnoptr,
-                         struct statvfs* stbuf) {
-  /* STUB */
-  return -1;
-}
+int __myfs_statfs_implem(void *fsptr, size_t fssize, int *errnoptr, struct statvfs *stbuf) {
+    if (fsptr == NULL || stbuf == NULL) {
+        if (errnoptr != NULL) {
+            *errnoptr = EFAULT;
+        }
+        return -1;
+    }
 
+    myfs_superblock_t *fs = (myfs_superblock_t *)fsptr;
+
+    stbuf->f_bsize = fs->block_size;
+    stbuf->f_blocks = fs->total_blocks;
+    stbuf->f_bfree = fs->free_blocks;
+    stbuf->f_bavail = fs->free_blocks;
+    stbuf->f_namemax = fs->namemax;
+
+    return 0;
+}
